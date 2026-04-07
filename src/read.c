@@ -707,18 +707,51 @@ static bool taste_file_index(io_block_t *ib) {
 #define ROUND_UP_TO_TAR_BLOCK(n) \
     (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
-/* Return the full compound extension (including the leading dot) from the last
- * path component, anchored at the *first* dot in the basename.  Using the
- * first dot means that multi-part suffixes like ".so.1", ".tar.gz", or ".h.in"
- * are kept intact, so e.g. shared-library version suffixes (.so.1) are not
- * confused with man-page suffixes (.1).  Returns an empty string if there is
- * no extension. */
+/* Return the extension (including the leading dot) from the last path
+ * component.  Uses the *last* dot so that dots in version numbers or other
+ * stem components (e.g. "libstdc++6-4.4-dev_4.4.5-8_i386.deb") do not
+ * corrupt extension grouping.  A leading dot (hidden files like ".gitignore")
+ * is not treated as an extension separator.
+ *
+ * For compressed files the inner format is ignored — "archive.tar.gz" and
+ * "image.cpio.gz" both return ".gz" and group together, which is correct
+ * because the compression format dominates compressibility.
+ *
+ * A trailing ".svn-base" suffix (Subversion pristine-copy marker) is stripped
+ * before the extension is determined, so "foo.c.svn-base" groups with ".c".
+ *
+ * Returns an empty string if there is no extension. */
 static const char *file_type_ext(const char *name) {
     if (!name) return "";
+
+    /* Find the start of the last path component. */
     const char *slash = strrchr(name, '/');
     const char *base  = slash ? slash + 1 : name;
-    const char *dot   = strchr(base, '.');
-    return dot ? dot : "";
+
+    /* Strip a trailing ".svn-base" suffix.  We need the result to be
+     * null-terminated at the right place, so copy into a static buffer when
+     * stripping is needed; the comparator that calls us is single-threaded. */
+    static const char svn_sfx[] = ".svn-base";
+    static char buf[4096];
+    size_t blen = strlen(base);
+    if (blen >= sizeof svn_sfx - 1 &&
+            memcmp(base + blen - (sizeof svn_sfx - 1),
+                   svn_sfx, sizeof svn_sfx - 1) == 0) {
+        size_t tlen = blen - (sizeof svn_sfx - 1);
+        if (tlen >= sizeof buf) tlen = sizeof buf - 1;
+        memcpy(buf, base, tlen);
+        buf[tlen] = '\0';
+        base = buf;
+    }
+
+    /* Find the last dot.  A leading dot is not an extension separator. */
+    const char *dot = NULL;
+    for (const char *p = base + strlen(base) - 1; p > base; p--) {
+        if (*p == '.') { dot = p; break; }
+    }
+    if (!dot) return "";
+
+    return dot;
 }
 
 /* Counters for monitoring block (re-)decompression during sorted extract.
