@@ -32,7 +32,7 @@ static void usage(const char *msg) {
 "  pixz -d input.tpxz output.tar   # Decompress\n"
 "  pixz -l input.tpxz              # List tarball contents very fast\n"
 "  pixz -x path/to/file < input.tpxz | tar x  # Extract one file very fast\n"
-"  pixz -S input.tpxz | tar x      # Extract sorted by directory, file type, then name\n"
+"  pixz -S input.tpxz | tar x      # Extract sorted for best re-compression\n"
 "  tar -Ipixz -cf output.tpxz dir  # Make tar use pixz automatically\n"
 "\n"
 "Input and output:\n"

@@ -717,29 +717,82 @@ static const char *file_type_ext(const char *name) {
     return dot ? dot : "";
 }
 
+/* Files at least this large flush the entire LZMA dictionary on their own.
+ * Populated from the actual block headers before sorting; falls back to
+ * 8 MiB (the level-6 default) if the dict size cannot be determined. */
+static size_t gSortDictSize = 8 * 1024 * 1024;
+
+/* Read the LZMA dictionary size from the first data block in the stream.
+ * fio is the compressed offset of the pixz file-index block (to be skipped).
+ * Returns 0 if no suitable block is found (caller should keep the default). */
+static size_t read_lzma_dict_size(lzma_vli fio) {
+    lzma_index_iter iter;
+    lzma_index_iter_init(&iter, gIndex);
+    while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK)) {
+        if (iter.block.compressed_file_offset == fio)
+            continue;
+        if (!iter.stream.flags)
+            continue;
+
+        if (fseeko(gInFile, (off_t)iter.block.compressed_file_offset,
+                   SEEK_SET) == -1)
+            break;
+        int hb = fgetc(gInFile);
+        if (hb == EOF || hb == 0)
+            break;
+
+        lzma_filter filters[LZMA_FILTERS_MAX + 1];
+        lzma_block block = { .filters = filters,
+                             .check = iter.stream.flags->check,
+                             .version = 0 };
+        block.header_size = lzma_block_header_size_decode(hb);
+
+        uint8_t hdrbuf[LZMA_BLOCK_HEADER_SIZE_MAX];
+        hdrbuf[0] = (uint8_t)hb;
+        if (fread(hdrbuf + 1, block.header_size - 1, 1, gInFile) != 1)
+            break;
+        if (lzma_block_header_decode(&block, NULL, hdrbuf) != LZMA_OK)
+            break;
+
+        size_t dict_size = 0;
+        for (int i = 0; filters[i].id != LZMA_VLI_UNKNOWN; i++) {
+            if (filters[i].id == LZMA_FILTER_LZMA2 ||
+                    filters[i].id == LZMA_FILTER_LZMA1) {
+                dict_size =
+                    ((lzma_options_lzma *)filters[i].options)->dict_size;
+                break;
+            }
+        }
+        lzma_filters_free(filters, NULL);
+        return dict_size;
+    }
+    return 0;
+}
+
 static int cmp_sorted_files(const void *a, const void *b) {
     const file_index_t * const *fa = (const file_index_t * const *)a;
     const file_index_t * const *fb = (const file_index_t * const *)b;
     const char *na = (*fa)->name ? (*fa)->name : "";
     const char *nb = (*fb)->name ? (*fb)->name : "";
 
-    /* Compare directory parts first: files that share a directory are most
-     * similar to each other, so grouping them maximises LZMA compression
-     * when the output is re-compressed. */
-    const char *la = strrchr(na, '/');
-    const char *lb = strrchr(nb, '/');
-    size_t da = la ? (size_t)(la - na + 1) : 0;  /* length incl. trailing '/' */
-    size_t db = lb ? (size_t)(lb - nb + 1) : 0;
-    size_t dmin = da < db ? da : db;
-    int r = strncmp(na, nb, dmin);
-    if (r != 0) return r;
-    if (da != db) return (da < db) ? -1 : 1;
+    /* Primary: small files (< dict size) sort before large files.
+     * Large files flush the LZMA dictionary entirely on their own, so they
+     * gain nothing from adjacency to other files; isolating them prevents them
+     * from breaking up runs of compressible content. */
+    int la = ((*fa)->next->offset - (*fa)->offset) >= (off_t)gSortDictSize;
+    int lb = ((*fb)->next->offset - (*fb)->offset) >= (off_t)gSortDictSize;
+    if (la != lb) return la - lb;   /* 0 (small) sorts before 1 (large) */
 
-    /* Same directory: group by extension so similar file types are adjacent. */
-    r = strcmp(file_type_ext(na), file_type_ext(nb));
+    /* Secondary: group globally by extension.  This keeps all .c files
+     * together, all .py files together, etc., across the whole archive,
+     * building a richer LZMA dictionary for each file type. */
+    int r = strcmp(file_type_ext(na), file_type_ext(nb));
     if (r != 0) return r;
 
-    /* Same directory + extension: stable order by full path. */
+    /* Tertiary: within the same extension, group by full path.  strcmp on the
+     * complete path naturally clusters same-directory files together (they
+     * share an identical prefix through the last '/') while also providing a
+     * stable total order within each directory. */
     return strcmp(na, nb);
 }
 
@@ -818,7 +871,8 @@ static size_t lu_last_user(const lu_table_t *t, lzma_vli off) {
 }
 
 /* Returns the smallest accessing index strictly greater than after_idx,
- * or SIZE_MAX if there is none (block is no longer needed). */
+ * or SIZE_MAX if there is none.  Used for the cache-bypass check: is this
+ * block needed by any file AFTER the current one? */
 static size_t lu_next_user(const lu_table_t *t, lzma_vli off, size_t after_idx) {
     size_t h = LU_HASH(off);
     for (const lu_entry_t *e = t->b[h]; e; e = e->next) {
@@ -828,6 +882,25 @@ static size_t lu_next_user(const lu_table_t *t, lzma_vli off, size_t after_idx) 
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
             if (e->users[mid] <= after_idx) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < e->user_count ? e->users[lo] : SIZE_MAX;
+    }
+    return SIZE_MAX;
+}
+
+/* Returns the smallest accessing index >= from_idx (inclusive),
+ * or SIZE_MAX if there is none.  Used for the Bélády eviction key: a block
+ * needed AT the current file index must not be evicted (its distance = 0). */
+static size_t lu_next_user_from(const lu_table_t *t, lzma_vli off, size_t from_idx) {
+    size_t h = LU_HASH(off);
+    for (const lu_entry_t *e = t->b[h]; e; e = e->next) {
+        if (e->comp_off != off) continue;
+        /* Binary search for first element >= from_idx. */
+        size_t lo = 0, hi = e->user_count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (e->users[mid] < from_idx) lo = mid + 1;
             else hi = mid;
         }
         return lo < e->user_count ? e->users[lo] : SIZE_MAX;
@@ -845,6 +918,25 @@ static void lu_free(lu_table_t *t) {
             e = n;
         }
         t->b[h] = NULL;
+    }
+}
+
+/* Remove entries that are accessed by only one file.  Such blocks will never
+ * be shared and need not be cached.  Absent entries return SIZE_MAX from all
+ * lu queries, which is the correct "don't cache / no future user" signal. */
+static void lu_prune_single_user(lu_table_t *t) {
+    for (int h = 0; h < LU_HASH_SIZE; ++h) {
+        lu_entry_t **pp = &t->b[h];
+        while (*pp) {
+            lu_entry_t *e = *pp;
+            if (e->user_count < 2) {
+                *pp = e->next;
+                free(e->users);
+                free(e);
+            } else {
+                pp = &e->next;
+            }
+        }
     }
 }
 
@@ -871,7 +963,6 @@ static void lu_free(lu_table_t *t) {
 typedef struct bc_entry_t bc_entry_t;
 struct bc_entry_t {
     lzma_vli   comp_off;    /* compressed-stream offset (key) */
-    off_t      ustart;      /* uncompressed start of this block's data */
     uint8_t   *data;        /* decompressed bytes (owned by this entry) */
     size_t     size;        /* number of decompressed bytes */
     size_t     last_user;   /* sorted-order index of last file using block */
@@ -902,14 +993,15 @@ static void bc_remove(bc_t *c, bc_entry_t *e) {
 }
 
 /* Evict the entry whose *next* consumer is furthest ahead (true Bélády).
- * Scans all BC_MAX_ENTRIES cached blocks, queries lu_next_user for each,
- * and removes the one with the largest result.  O(BC_MAX_ENTRIES) per call. */
+ * Uses lu_next_user_from (>= current_idx) so that blocks still needed during
+ * the current file's iteration are never chosen as victims (their distance is
+ * current_idx — the smallest possible).  O(BC_MAX_ENTRIES) per call. */
 static void bc_evict_belady(bc_t *c, const lu_table_t *lu, size_t current_idx) {
     bc_entry_t *victim = NULL;
     size_t victim_next = 0;
     for (int h = 0; h < BC_HASH_SIZE; ++h) {
         for (bc_entry_t *e = c->buckets[h]; e; e = e->hash_next) {
-            size_t nxt = lu_next_user(lu, e->comp_off, current_idx);
+            size_t nxt = lu_next_user_from(lu, e->comp_off, current_idx);
             if (!victim || nxt > victim_next) {
                 victim = e;
                 victim_next = nxt;
@@ -919,13 +1011,13 @@ static void bc_evict_belady(bc_t *c, const lu_table_t *lu, size_t current_idx) {
     if (victim) bc_remove(c, victim);
 }
 
-/* Insert a decompressed block, taking ownership of data. */
-static bc_entry_t *bc_insert(bc_t *c, lzma_vli off, off_t ustart,
+/* Insert a decompressed block into the cache, taking ownership of data. */
+static bc_entry_t *bc_insert(bc_t *c, lzma_vli off,
                               uint8_t *data, size_t size, size_t last_user,
                               const lu_table_t *lu, size_t current_idx) {
     if (c->count >= BC_MAX_ENTRIES) bc_evict_belady(c, lu, current_idx);
     bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
-    e->comp_off = off; e->ustart = ustart;
+    e->comp_off = off;
     e->data = data; e->size = size; e->last_user = last_user;
     e->hash_next = c->buckets[BC_HASH(off)];
     c->buckets[BC_HASH(off)] = e;
@@ -1000,6 +1092,7 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
         err = lzma_code(&stream, LZMA_RUN);
     }
     lzma_end(&stream);
+    lzma_filters_free(filters, NULL);
     return output;
 }
 
@@ -1007,8 +1100,10 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
 /* ---- per-file buffer fill --------------------------------------------- */
 
 /* Copy the bytes of one file [fstart, fend) from lzma blocks into buf.
- * Blocks are fetched from (or added to) the Bélády cache so that blocks
- * shared by consecutive sorted files are decompressed only once. */
+ * Blocks with future consumers are fetched from (or added to) the Bélády
+ * cache so they are decompressed only once.  Blocks with no future consumer
+ * (single-use or last-use) are decompressed, copied, and freed immediately
+ * to avoid polluting the cache with data no subsequent file needs. */
 static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
                           lzma_vli fio, bc_t *cache, const lu_table_t *lu,
                           size_t current_idx) {
@@ -1027,48 +1122,67 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
             break;      /* no more blocks overlap this file */
         off_t blk_uend = blk_ustart + (off_t)iter.block.uncompressed_size;
 
-        /* Get the block from the cache, or decompress and cache it. */
+        /* Obtain the decompressed block data (from cache or fresh). */
         bc_entry_t *ce = bc_lookup(cache, iter.block.compressed_file_offset);
-        if (!ce) {
+        uint8_t *bdata_free = NULL;  /* non-NULL: caller must free after copy */
+        const uint8_t *bdata;
+        if (ce) {
+            bdata = ce->data;
+        } else {
             if (!iter.stream.flags)
                 die("Missing stream flags for block");
-            uint8_t *bdata = decompress_block_at(
+            uint8_t *new_data = decompress_block_at(
                 iter.block.compressed_file_offset,
                 iter.stream.flags->check,
                 (size_t)iter.block.uncompressed_size);
-            size_t lu_val = lu_last_user(lu, iter.block.compressed_file_offset);
-            ce = bc_insert(cache,
-                           iter.block.compressed_file_offset, blk_ustart,
-                           bdata, (size_t)iter.block.uncompressed_size,
-                           lu_val, lu, current_idx);
+            /* If no future consumer exists after current_idx, bypass the
+             * cache to avoid evicting genuinely shared blocks. */
+            if (lu_next_user(lu, iter.block.compressed_file_offset,
+                             current_idx) != SIZE_MAX) {
+                size_t lu_val = lu_last_user(lu,
+                                    iter.block.compressed_file_offset);
+                ce = bc_insert(cache,
+                               iter.block.compressed_file_offset,
+                               new_data, (size_t)iter.block.uncompressed_size,
+                               lu_val, lu, current_idx);
+                bdata = ce->data;
+            } else {
+                bdata = bdata_free = new_data;
+            }
         }
 
         /* Copy the overlapping byte range into the file buffer. */
         off_t cstart = fstart > blk_ustart ? fstart : blk_ustart;
         off_t cend   = fend   < blk_uend   ? fend   : blk_uend;
-        memcpy(buf    + (size_t)(cstart - fstart),
-               ce->data + (size_t)(cstart - blk_ustart),
+        memcpy(buf   + (size_t)(cstart - fstart),
+               bdata + (size_t)(cstart - blk_ustart),
                (size_t)(cend - cstart));
+        free(bdata_free);
     } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
 }
 
 
 /* ---- main entry point ------------------------------------------------- */
 
-/* Load the pixz index once, sort it by directory then file type (extension)
- * then by filename within each directory, and write the tar entries (headers
- * + data) to gOutFile in that new order.  Grouping files by directory first
- * maximises LZMA compression when the output is re-compressed with pixz,
- * because files in the same directory share vocabulary (path prefixes,
- * identifiers, patterns) that fits well within LZMA's sliding-window
- * dictionary.  Within each directory, files are further grouped by extension.
+/* Load the pixz index once, sort the files, and write the tar entries
+ * (headers + data) to gOutFile in that new order.
  *
- * A Bélády-optimal decompression cache prevents repeated decompression of
- * lzma blocks that are shared by multiple files.  A per-block access list
- * (built in one prepass over the sorted file list) drives both the proactive
- * eviction (bc_evict_done, called after each file) and the true Bélády
- * fallback (bc_evict_belady): when the cache is full, the entry whose *next*
- * consumer is furthest ahead is evicted — the theoretically optimal choice. */
+ * Sort key: (is_large, extension, directory, name).
+ *   is_large   – files >= LARGE_FILE_THRESHOLD go last; they flush the LZMA
+ *                dictionary entirely on their own and gain nothing from
+ *                adjacency to other files.
+ *   extension  – groups globally similar types (all .c together, all .py
+ *                together), giving LZMA a rich shared dictionary per type.
+ *   directory  – within the same type, same-directory files share
+ *                project-specific identifiers that LZMA exploits well.
+ *   name       – stable tie-breaker.
+ *
+ * Bélády-optimal decompression cache: blocks shared by multiple files are
+ * decompressed only once.  Blocks with no future consumer are decompressed,
+ * copied, and freed immediately without entering the cache.  A per-block
+ * access list (built in one prepass) drives both the proactive eviction
+ * (bc_evict_done) and the Bélády fallback (bc_evict_belady): when the cache
+ * is full, the entry whose *next* consumer is furthest ahead is evicted. */
 void pixz_sorted_extract(void) {
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
@@ -1093,6 +1207,9 @@ void pixz_sorted_extract(void) {
     size_t i = 0;
     for (file_index_t *f = gFileIndex; f && f->name; f = f->next)
         sorted[i++] = f;
+    size_t dict_size = read_lzma_dict_size(fio);
+    if (dict_size > 0)
+        gSortDictSize = dict_size;
     qsort(sorted, count, sizeof(file_index_t *), cmp_sorted_files);
 
     off_t  *starts = xmalloc(count * sizeof(off_t));
@@ -1117,7 +1234,9 @@ void pixz_sorted_extract(void) {
      *
      * Iterate sorted files in order (i = 0 … count-1).  For each file,
      * locate its overlapping blocks and record i as an accessing index.
-     * Because i is non-decreasing, lu_add_access appends in sorted order. */
+     * Because i is non-decreasing, lu_add_access appends in sorted order.
+     * After the loop, prune single-access entries: those blocks are never
+     * shared and should never enter the cache. */
     lu_table_t lu;
     lu_init(&lu);
     for (i = 0; i < count; ++i) {
@@ -1134,6 +1253,7 @@ void pixz_sorted_extract(void) {
             lu_add_access(&lu, iter.block.compressed_file_offset, i);
         } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
     }
+    lu_prune_single_user(&lu);
 
     /* Extract and write files in sorted order.
      *
