@@ -105,4 +105,52 @@ if [ "$ORIG_SIZE" != "$SORTED_SIZE" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Test 2: truncated archive — last entry is a 0-byte file and the archive
+# ends with only a handful of null bytes (no proper 1024-byte EOF marker).
+# This is non-conformant but pixz must reproduce the exact tail faithfully.
+# ---------------------------------------------------------------------------
+
+TRUNC_DIR=$TMPDIR/trunc
+mkdir -p "$TRUNC_DIR"
+printf 'data\n' > "$TRUNC_DIR/data.txt"
+> "$TRUNC_DIR/empty"           # 0-byte file; this will be the last entry
+
+# Build a normal tar, then truncate it to simulate a stripped EOF.
+TRUNC_TAR=$TMPDIR/trunc.tar
+tar cf "$TRUNC_TAR" -C "$TRUNC_DIR" data.txt empty
+
+# Find where the archive content actually ends (strip the standard 1024-byte
+# EOF marker so only a small stub remains).
+TRUNC_SIZE=$(wc -c < "$TRUNC_TAR")
+# Keep all but 1020 bytes of the trailing zeros (leave 4 null bytes).
+CONTENT_SIZE=$((TRUNC_SIZE - 1020))
+dd if="$TRUNC_TAR" of="$TRUNC_TAR.short" bs=1 count="$CONTENT_SIZE" 2>/dev/null
+mv "$TRUNC_TAR.short" "$TRUNC_TAR"
+
+TRUNC_PIXZ=$TMPDIR/trunc.tpxz
+TRUNC_SORTED=$TMPDIR/trunc_sorted.tar
+
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" $PIXZ "$TRUNC_TAR" "$TRUNC_PIXZ" 2>/dev/null || true
+$PIXZ -S "$TRUNC_PIXZ" > "$TRUNC_SORTED"
+
+# Output must be exactly the same byte count as the truncated input.
+TRUNC_ORIG_SIZE=$(wc -c < "$TRUNC_TAR")
+TRUNC_SORTED_SIZE=$(wc -c < "$TRUNC_SORTED")
+if [ "$TRUNC_ORIG_SIZE" != "$TRUNC_SORTED_SIZE" ]; then
+    echo "FAIL (truncated archive): size mismatch: original=$TRUNC_ORIG_SIZE sorted=$TRUNC_SORTED_SIZE"
+    exit 1
+fi
+
+# The 0-byte file must still be present in the sorted output.
+TRUNC_ACTUAL=$(tar tf "$TRUNC_SORTED" 2>/dev/null || true)
+case "$TRUNC_ACTUAL" in
+    *empty*) ;;
+    *)
+        echo "FAIL (truncated archive): 'empty' not found in sorted output"
+        echo "Got: $TRUNC_ACTUAL"
+        exit 1
+        ;;
+esac
+
 exit 0
