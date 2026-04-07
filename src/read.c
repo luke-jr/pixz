@@ -703,6 +703,8 @@ static bool taste_file_index(io_block_t *ib) {
 
 #pragma mark SORTED EXTRACT
 
+#define TAR_BLOCK_SIZE  512     /* size of one tar header/data block in bytes */
+
 /* Return the file extension (including the dot) from the last path component.
  * Returns an empty string if there is no extension. */
 static const char *file_type_ext(const char *name) {
@@ -733,6 +735,11 @@ static int cmp_sorted_files(const void *a, const void *b) {
 #define LU_HASH_SIZE (1 << LU_HASH_BITS)
 #define LU_HASH_MASK (LU_HASH_SIZE - 1)
 
+/* Shift the offset right by 3 bits before masking: lzma block offsets are
+ * always aligned to at least 4 bytes, so the low bits carry no information.
+ * The shift improves hash distribution across the buckets. */
+#define LU_HASH(off)  ((size_t)((off) >> 3) & LU_HASH_MASK)
+
 typedef struct lu_entry_t lu_entry_t;
 struct lu_entry_t {
     lzma_vli   comp_off;
@@ -746,7 +753,7 @@ static void lu_init(lu_table_t *t) { memset(t, 0, sizeof(*t)); }
 
 /* Always overwrites; caller guarantees user values are non-decreasing. */
 static void lu_set(lu_table_t *t, lzma_vli off, size_t user) {
-    size_t h = (size_t)(off >> 3) & LU_HASH_MASK;
+    size_t h = LU_HASH(off);
     for (lu_entry_t *e = t->b[h]; e; e = e->next) {
         if (e->comp_off == off) { e->last_user = user; return; }
     }
@@ -757,7 +764,7 @@ static void lu_set(lu_table_t *t, lzma_vli off, size_t user) {
 
 /* Returns SIZE_MAX when the offset is not in the table. */
 static size_t lu_get(const lu_table_t *t, lzma_vli off) {
-    size_t h = (size_t)(off >> 3) & LU_HASH_MASK;
+    size_t h = LU_HASH(off);
     for (const lu_entry_t *e = t->b[h]; e; e = e->next)
         if (e->comp_off == off) return e->last_user;
     return SIZE_MAX;
@@ -785,6 +792,7 @@ static void lu_free(lu_table_t *t) {
 #define BC_HASH_SIZE    (1 << BC_HASH_BITS)
 #define BC_HASH_MASK    (BC_HASH_SIZE - 1)
 #define BC_MAX_ENTRIES  32          /* maximum number of cached blocks */
+#define BC_HASH(off)    ((size_t)(off) & BC_HASH_MASK)
 
 typedef struct bc_entry_t bc_entry_t;
 struct bc_entry_t {
@@ -807,7 +815,7 @@ typedef struct {
 static void bc_init(bc_t *c) { memset(c, 0, sizeof(*c)); }
 
 static bc_entry_t *bc_lookup(bc_t *c, lzma_vli off) {
-    for (bc_entry_t *e = c->buckets[off & BC_HASH_MASK]; e; e = e->hash_next)
+    for (bc_entry_t *e = c->buckets[BC_HASH(off)]; e; e = e->hash_next)
         if (e->comp_off == off) return e;
     return NULL;
 }
@@ -832,7 +840,7 @@ static void bc_touch(bc_t *c, bc_entry_t *e) {
 
 /* Remove one entry from the cache (hash + LRU) and free its storage. */
 static void bc_remove(bc_t *c, bc_entry_t *e) {
-    bc_entry_t **pp = &c->buckets[e->comp_off & BC_HASH_MASK];
+    bc_entry_t **pp = &c->buckets[BC_HASH(e->comp_off)];
     while (*pp && *pp != e) pp = &(*pp)->hash_next;
     if (*pp) *pp = e->hash_next;
     bc_lru_unlink(c, e);
@@ -852,8 +860,8 @@ static bc_entry_t *bc_insert(bc_t *c, lzma_vli off, off_t ustart,
     bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
     e->comp_off = off; e->ustart = ustart;
     e->data = data; e->size = size; e->last_user = last_user;
-    e->hash_next = c->buckets[off & BC_HASH_MASK];
-    c->buckets[off & BC_HASH_MASK] = e;
+    e->hash_next = c->buckets[BC_HASH(off)];
+    c->buckets[BC_HASH(off)] = e;
     e->lru_prev = e->lru_next = NULL;
     bc_lru_push_front(c, e);
     ++c->count;
@@ -1026,8 +1034,9 @@ void pixz_sorted_extract(void) {
     }
 
     /* Find the entry that is last in archive order; its size includes the
-     * original tar end-of-archive zeros and must be trimmed on output. */
-    size_t last_archive_idx = count;   /* count == "not found" sentinel */
+     * original tar end-of-archive zeros and must be trimmed on output.
+     * Use count as a sentinel meaning "not found". */
+    size_t last_archive_idx = count;
     for (size_t j = 0; j < count; ++j) {
         if (sorted[j]->next->name == NULL) { last_archive_idx = j; break; }
     }
@@ -1080,14 +1089,15 @@ void pixz_sorted_extract(void) {
          * end-of-archive zeros in its size.  Trim those zeros so they
          * do not appear in the middle of the sorted output stream.
          * Scan backwards for the last non-zero byte, then round up to
-         * the next 512-byte tar block boundary. */
+         * the next TAR_BLOCK_SIZE boundary. */
         size_t write_size = sizes[i];
         if (i == last_archive_idx) {
             ssize_t last_nz = (ssize_t)write_size - 1;
             while (last_nz >= 0 && fbuf[last_nz] == 0)
                 --last_nz;
             write_size = last_nz < 0 ? 0
-                : (size_t)(last_nz + 1 + 511) / 512 * 512;
+                : (size_t)(last_nz + TAR_BLOCK_SIZE) / TAR_BLOCK_SIZE
+                    * TAR_BLOCK_SIZE;
         }
 
         if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
@@ -1097,8 +1107,8 @@ void pixz_sorted_extract(void) {
         bc_evict_done(&cache, i);
     }
 
-    /* Write the tar end-of-archive marker: two 512-byte zero blocks. */
-    uint8_t tar_eof[1024];
+    /* Write the tar end-of-archive marker: two TAR_BLOCK_SIZE zero blocks. */
+    uint8_t tar_eof[TAR_BLOCK_SIZE * 2];
     memset(tar_eof, 0, sizeof(tar_eof));
     if (fwrite(tar_eof, sizeof(tar_eof), 1, gOutFile) != 1)
         die("Error writing tar EOF");
