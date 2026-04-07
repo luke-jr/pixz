@@ -708,19 +708,28 @@ static bool taste_file_index(io_block_t *ib) {
     (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
 /* Return the extension (including the leading dot) from the last path
- * component.  Uses the *last* dot so that dots in version numbers or other
- * stem components (e.g. "libstdc++6-4.4-dev_4.4.5-8_i386.deb") do not
- * corrupt extension grouping.  A leading dot (hidden files like ".gitignore")
- * is not treated as an extension separator.
- *
- * For compressed files the inner format is ignored — "archive.tar.gz" and
- * "image.cpio.gz" both return ".gz" and group together, which is correct
- * because the compression format dominates compressibility.
- *
- * A trailing ".svn-base" suffix (Subversion pristine-copy marker) is stripped
- * before the extension is determined, so "foo.c.svn-base" groups with ".c".
+ * component.  Uses the *last non-numeric* dot component so that:
+ *  - Dots in version-number stems (e.g. "libstdc++6-4.4-dev_4.4.5-8_i386.deb")
+ *    do not corrupt extension grouping — ".deb" is returned.
+ *  - Shared-library version suffixes (".so.1", ".so.1.2.3") are skipped and
+ *    the real extension ".so" is returned.
+ *  - For compressed files the inner format is ignored — "archive.tar.gz" and
+ *    "image.cpio.gz" both return ".gz", because the compression format
+ *    dominates compressibility.
+ *  - A trailing ".svn-base" suffix (Subversion pristine-copy marker) is
+ *    stripped first, so "foo.c.svn-base" groups with ".c".
+ *  - A leading dot (hidden files like ".gitignore") is not an extension.
  *
  * Returns an empty string if there is no extension. */
+
+/* Returns true iff the string [s, s+len) is non-empty and all ASCII digits. */
+static bool is_all_digits(const char *s, size_t len) {
+    if (len == 0) return false;
+    for (size_t i = 0; i < len; i++)
+        if (s[i] < '0' || s[i] > '9') return false;
+    return true;
+}
+
 static const char *file_type_ext(const char *name) {
     if (!name) return "";
 
@@ -744,14 +753,19 @@ static const char *file_type_ext(const char *name) {
         base = buf;
     }
 
-    /* Find the last dot.  A leading dot is not an extension separator. */
-    const char *dot = NULL;
-    for (const char *p = base + strlen(base) - 1; p > base; p--) {
-        if (*p == '.') { dot = p; break; }
+    /* Scan backwards for a dot whose following component is not purely
+     * numeric.  Purely-numeric components are version-number suffixes
+     * (e.g. the ".1.2.3" in "libfoo.so.1.2.3") and should be skipped.
+     * A leading dot (p == base) is never treated as an extension separator. */
+    const char *end = base + strlen(base);
+    for (const char *p = end - 1; p > base; p--) {
+        if (*p == '.') {
+            if (!is_all_digits(p + 1, (size_t)(end - (p + 1))))
+                return p;       /* non-numeric component: real extension */
+            end = p;            /* numeric component: skip and keep looking */
+        }
     }
-    if (!dot) return "";
-
-    return dot;
+    return "";
 }
 
 /* Counters for monitoring block (re-)decompression during sorted extract.
