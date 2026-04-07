@@ -720,9 +720,27 @@ static const char *file_type_ext(const char *name) {
 static int cmp_sorted_files(const void *a, const void *b) {
     const file_index_t * const *fa = (const file_index_t * const *)a;
     const file_index_t * const *fb = (const file_index_t * const *)b;
-    int r = strcmp(file_type_ext((*fa)->name), file_type_ext((*fb)->name));
+    const char *na = (*fa)->name ? (*fa)->name : "";
+    const char *nb = (*fb)->name ? (*fb)->name : "";
+
+    /* Compare directory parts first: files that share a directory are most
+     * similar to each other, so grouping them maximises LZMA compression
+     * when the output is re-compressed. */
+    const char *la = strrchr(na, '/');
+    const char *lb = strrchr(nb, '/');
+    size_t da = la ? (size_t)(la - na + 1) : 0;  /* length incl. trailing '/' */
+    size_t db = lb ? (size_t)(lb - nb + 1) : 0;
+    size_t dmin = da < db ? da : db;
+    int r = strncmp(na, nb, dmin);
     if (r != 0) return r;
-    return strcmp((*fa)->name, (*fb)->name);
+    if (da != db) return (da < db) ? -1 : 1;
+
+    /* Same directory: group by extension so similar file types are adjacent. */
+    r = strcmp(file_type_ext(na), file_type_ext(nb));
+    if (r != 0) return r;
+
+    /* Same directory + extension: stable order by full path. */
+    return strcmp(na, nb);
 }
 
 
@@ -781,13 +799,17 @@ static void lu_free(lu_table_t *t) {
 }
 
 
-/* ---- LRU block cache --------------------------------------------------
+/* ---- Bélády-optimal block cache ---------------------------------------
  *
  * Caches decompressed lzma blocks so that a block shared by several files
  * (in sorted order) is decompressed only once.  When the last consumer of
- * a block has been served, bc_evict_done() drops it immediately; otherwise
- * the classic LRU policy evicts the least-recently-used entry when the
- * cache is full.
+ * a block has been served, bc_evict_done() drops it immediately.  When the
+ * cache is full and a new block must be inserted, bc_evict_belady() evicts
+ * the entry whose last consumer is furthest ahead in sorted order — the
+ * optimal (Bélády) policy.  Because bc_evict_done() guarantees that every
+ * cached entry's last_user is strictly greater than the current file index,
+ * the largest last_user value identifies the entry that can be deferred the
+ * longest, making it the correct eviction target.
  */
 
 #define BC_HASH_BITS    6
@@ -804,13 +826,10 @@ struct bc_entry_t {
     size_t     size;        /* number of decompressed bytes */
     size_t     last_user;   /* sorted-order index of last file using block */
     bc_entry_t *hash_next;  /* hash-chain */
-    bc_entry_t *lru_prev;   /* LRU doubly-linked list (head = MRU) */
-    bc_entry_t *lru_next;
 };
 
 typedef struct {
     bc_entry_t *buckets[BC_HASH_SIZE];
-    bc_entry_t *lru_head, *lru_tail;
     size_t      count;
 } bc_t;
 
@@ -822,50 +841,40 @@ static bc_entry_t *bc_lookup(bc_t *c, lzma_vli off) {
     return NULL;
 }
 
-static void bc_lru_unlink(bc_t *c, bc_entry_t *e) {
-    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
-    else             c->lru_head = e->lru_next;
-    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
-    else             c->lru_tail = e->lru_prev;
-}
-
-static void bc_lru_push_front(bc_t *c, bc_entry_t *e) {
-    e->lru_prev = NULL; e->lru_next = c->lru_head;
-    if (c->lru_head) c->lru_head->lru_prev = e;
-    else             c->lru_tail = e;
-    c->lru_head = e;
-}
-
-static void bc_touch(bc_t *c, bc_entry_t *e) {
-    bc_lru_unlink(c, e); bc_lru_push_front(c, e);
-}
-
-/* Remove one entry from the cache (hash + LRU) and free its storage. */
+/* Remove one entry from the cache (hash) and free its storage. */
 static void bc_remove(bc_t *c, bc_entry_t *e) {
     bc_entry_t **pp = &c->buckets[BC_HASH(e->comp_off)];
     while (*pp && *pp != e) pp = &(*pp)->hash_next;
     if (*pp) *pp = e->hash_next;
-    bc_lru_unlink(c, e);
     free(e->data);
     free(e);
     --c->count;
 }
 
-static void bc_evict_lru(bc_t *c) {
-    if (c->lru_tail) bc_remove(c, c->lru_tail);
+/* Evict the entry whose last consumer is furthest ahead (Bélády's policy).
+ * bc_evict_done() guarantees that all cached entries have last_user strictly
+ * greater than the current file index, so the entry with the largest
+ * last_user is the correct eviction target. */
+static void bc_evict_belady(bc_t *c) {
+    bc_entry_t *victim = NULL;
+    for (int h = 0; h < BC_HASH_SIZE; ++h) {
+        for (bc_entry_t *e = c->buckets[h]; e; e = e->hash_next) {
+            if (!victim || e->last_user > victim->last_user)
+                victim = e;
+        }
+    }
+    if (victim) bc_remove(c, victim);
 }
 
 /* Insert a decompressed block, taking ownership of data. */
 static bc_entry_t *bc_insert(bc_t *c, lzma_vli off, off_t ustart,
                               uint8_t *data, size_t size, size_t last_user) {
-    if (c->count >= BC_MAX_ENTRIES) bc_evict_lru(c);
+    if (c->count >= BC_MAX_ENTRIES) bc_evict_belady(c);
     bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
     e->comp_off = off; e->ustart = ustart;
     e->data = data; e->size = size; e->last_user = last_user;
     e->hash_next = c->buckets[BC_HASH(off)];
     c->buckets[BC_HASH(off)] = e;
-    e->lru_prev = e->lru_next = NULL;
-    bc_lru_push_front(c, e);
     ++c->count;
     return e;
 }
@@ -888,7 +897,6 @@ static void bc_free(bc_t *c) {
         while (e) { bc_entry_t *nx = e->hash_next; free(e->data); free(e); e = nx; }
         c->buckets[h] = NULL;
     }
-    c->lru_head = c->lru_tail = NULL;
     c->count = 0;
 }
 
@@ -966,9 +974,7 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
 
         /* Get the block from the cache, or decompress and cache it. */
         bc_entry_t *ce = bc_lookup(cache, iter.block.compressed_file_offset);
-        if (ce) {
-            bc_touch(cache, ce);
-        } else {
+        if (!ce) {
             if (!iter.stream.flags)
                 die("Missing stream flags for block");
             uint8_t *bdata = decompress_block_at(
@@ -994,14 +1000,20 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
 
 /* ---- main entry point ------------------------------------------------- */
 
-/* Load the pixz index once, sort it by file type (extension) then by
- * filename, and write the tar entries (headers + data) to gOutFile in that
- * new order.
+/* Load the pixz index once, sort it by directory then file type (extension)
+ * then by filename within each directory, and write the tar entries (headers
+ * + data) to gOutFile in that new order.  Grouping files by directory first
+ * maximises LZMA compression when the output is re-compressed with pixz,
+ * because files in the same directory share vocabulary (path prefixes,
+ * identifiers, patterns) that fits well within LZMA's sliding-window
+ * dictionary.  Within each directory, files are further grouped by extension.
  *
- * An LRU decompression cache prevents repeated decompression of lzma blocks
- * that are shared by multiple files.  A last-user table (built in one pass
- * over the sorted file list) lets the cache drop each entry as soon as its
- * last consumer has been served, keeping memory usage low. */
+ * A Bélády-optimal decompression cache prevents repeated decompression of
+ * lzma blocks that are shared by multiple files.  A last-user table (built
+ * in one prepass over the sorted file list) drives both the proactive
+ * eviction (bc_evict_done, called after each file) and the Bélády fallback
+ * (bc_evict_belady): when the cache is full, the entry whose last consumer
+ * is furthest ahead is evicted — the theoretically optimal choice. */
 void pixz_sorted_extract(void) {
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
