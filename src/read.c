@@ -717,6 +717,14 @@ static const char *file_type_ext(const char *name) {
     return dot ? dot : "";
 }
 
+/* Counters for monitoring block (re-)decompression during sorted extract.
+ * Printed to stderr at the end of pixz_sorted_extract when DEBUG is enabled. */
+typedef struct {
+    size_t decompressions;   /* total calls to decompress_block_at */
+    size_t cache_hits;       /* blocks served from the Bélády cache */
+    size_t redecompressions; /* blocks decompressed >1 time due to eviction */
+} sort_stats_t;
+
 /* Dictionary size of the *recompressor* that will consume the sorted output.
  * Files larger than this threshold flush a full dictionary window on their own
  * and gain nothing from adjacency; they are sorted last to avoid disrupting
@@ -802,6 +810,7 @@ struct lu_entry_t {
     size_t     user_count;
     size_t     user_cap;
     lu_entry_t *next;       /* hash-chain */
+    bool       seen;        /* true once this block has been decompressed */
 };
 
 typedef struct { lu_entry_t *b[LU_HASH_SIZE]; } lu_table_t;
@@ -880,6 +889,22 @@ static size_t lu_next_user_from(const lu_table_t *t, lzma_vli off, size_t from_i
         return lo < e->user_count ? e->users[lo] : SIZE_MAX;
     }
     return SIZE_MAX;
+}
+
+/* Returns true if this block has been decompressed at least once.
+ * Returns false for blocks not in the table (single-user blocks, pruned out). */
+static bool lu_is_seen(const lu_table_t *t, lzma_vli off) {
+    size_t h = LU_HASH(off);
+    for (const lu_entry_t *e = t->b[h]; e; e = e->next)
+        if (e->comp_off == off) return e->seen;
+    return false;
+}
+
+/* Mark a block as having been decompressed.  No-op if not in the table. */
+static void lu_mark_seen(lu_table_t *t, lzma_vli off) {
+    size_t h = LU_HASH(off);
+    for (lu_entry_t *e = t->b[h]; e; e = e->next)
+        if (e->comp_off == off) { e->seen = true; return; }
 }
 
 static void lu_free(lu_table_t *t) {
@@ -1077,10 +1102,11 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
  * Blocks with future consumers are fetched from (or added to) the Bélády
  * cache so they are decompressed only once.  Blocks with no future consumer
  * (single-use or last-use) are decompressed, copied, and freed immediately
- * to avoid polluting the cache with data no subsequent file needs. */
+ * to avoid polluting the cache with data no subsequent file needs.
+ * *stats is updated with cache-hit and (re-)decompression counts. */
 static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
-                          lzma_vli fio, bc_t *cache, const lu_table_t *lu,
-                          size_t current_idx) {
+                          lzma_vli fio, bc_t *cache, lu_table_t *lu,
+                          size_t current_idx, sort_stats_t *stats) {
     lzma_index_iter iter;
     lzma_index_iter_init(&iter, gIndex);
     if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
@@ -1101,10 +1127,16 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
         uint8_t *bdata_free = NULL;  /* non-NULL: caller must free after copy */
         const uint8_t *bdata;
         if (ce) {
+            stats->cache_hits++;
             bdata = ce->data;
         } else {
             if (!iter.stream.flags)
                 die("Missing stream flags for block");
+            /* Count re-decompressions: shared blocks (in lu_table) that have
+             * already been decompressed once but were evicted from the cache. */
+            if (lu_is_seen(lu, iter.block.compressed_file_offset))
+                stats->redecompressions++;
+            stats->decompressions++;
             uint8_t *new_data = decompress_block_at(
                 iter.block.compressed_file_offset,
                 iter.stream.flags->check,
@@ -1113,6 +1145,7 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
              * cache to avoid evicting genuinely shared blocks. */
             if (lu_next_user(lu, iter.block.compressed_file_offset,
                              current_idx) != SIZE_MAX) {
+                lu_mark_seen(lu, iter.block.compressed_file_offset);
                 size_t lu_val = lu_last_user(lu,
                                     iter.block.compressed_file_offset);
                 ce = bc_insert(cache,
@@ -1240,6 +1273,7 @@ void pixz_sorted_extract(void) {
     bc_init(&cache);
     uint8_t *fbuf     = NULL;
     size_t   fbuf_cap = 0;
+    sort_stats_t stats = { 0, 0, 0 };
 
     /* tail_zeros: the number of trailing zero bytes to write after all sorted
      * entries.  We reproduce exactly the bytes that were at the tail of the
@@ -1258,7 +1292,7 @@ void pixz_sorted_extract(void) {
         }
 
         fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
-                      fio, &cache, &lu, i);
+                      fio, &cache, &lu, i, &stats);
 
         /* The entry that is last in archive order carries trailing tar
          * end-of-archive zeros in its size (two-block EOF marker plus any
@@ -1324,6 +1358,10 @@ void pixz_sorted_extract(void) {
             die("Error writing tar EOF");
         free(tar_eof);
     }
+
+    debug("sorted-extract stats: decompressions=%zu  cache_hits=%zu"
+          "  redecompressions=%zu",
+          stats.decompressions, stats.cache_hits, stats.redecompressions);
 
     bc_free(&cache);
     lu_free(&lu);
