@@ -707,13 +707,17 @@ static bool taste_file_index(io_block_t *ib) {
 #define ROUND_UP_TO_TAR_BLOCK(n) \
     (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
-/* Return the file extension (including the dot) from the last path component.
- * Returns an empty string if there is no extension. */
+/* Return the full compound extension (including the leading dot) from the last
+ * path component, anchored at the *first* dot in the basename.  Using the
+ * first dot means that multi-part suffixes like ".so.1", ".tar.gz", or ".h.in"
+ * are kept intact, so e.g. shared-library version suffixes (.so.1) are not
+ * confused with man-page suffixes (.1).  Returns an empty string if there is
+ * no extension. */
 static const char *file_type_ext(const char *name) {
     if (!name) return "";
     const char *slash = strrchr(name, '/');
     const char *base  = slash ? slash + 1 : name;
-    const char *dot   = strrchr(base, '.');
+    const char *dot   = strchr(base, '.');
     return dot ? dot : "";
 }
 
