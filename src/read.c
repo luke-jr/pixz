@@ -722,14 +722,6 @@ static bool taste_file_index(io_block_t *ib) {
  *
  * Returns an empty string if there is no extension. */
 
-/* Returns true iff the string [s, s+len) is non-empty and all ASCII digits. */
-static bool is_all_digits(const char *s, size_t len) {
-    if (len == 0) return false;
-    for (size_t i = 0; i < len; i++)
-        if (s[i] < '0' || s[i] > '9') return false;
-    return true;
-}
-
 static const char *file_type_ext(const char *name) {
     if (!name) return "";
 
@@ -753,16 +745,22 @@ static const char *file_type_ext(const char *name) {
         base = buf;
     }
 
-    /* Scan backwards for a dot whose following component is not purely
-     * numeric.  Purely-numeric components are version-number suffixes
-     * (e.g. the ".1.2.3" in "libfoo.so.1.2.3") and should be skipped.
+    /* Scan backwards, tracking whether every character seen since the last dot
+     * (or the end of the string) has been a digit.  When we reach a dot:
+     *  - if the component to its right was non-numeric, this is the real
+     *    extension — return it;
+     *  - if it was purely numeric (a version-number suffix like ".1" or ".2.3"
+     *    in "libfoo.so.1.2.3"), reset the flag and keep scanning left.
      * A leading dot (p == base) is never treated as an extension separator. */
-    const char *end = base + strlen(base);
-    for (const char *p = end - 1; p > base; p--) {
+    bool component_all_digits = true;
+    for (const char *p = base + strlen(base) - 1; p > base; p--) {
         if (*p == '.') {
-            if (!is_all_digits(p + 1, (size_t)(end - (p + 1))))
-                return p;       /* non-numeric component: real extension */
-            end = p;            /* numeric component: skip and keep looking */
+            if (!component_all_digits)
+                return p;
+            component_all_digits = true;  /* reset for the next component */
+        } else {
+            if (*p < '0' || *p > '9')
+                component_all_digits = false;
         }
     }
     return "";
