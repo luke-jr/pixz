@@ -699,3 +699,189 @@ static bool taste_tar(io_block_t *ib) {
 static bool taste_file_index(io_block_t *ib) {
 	return xle64dec(ib->output) == PIXZ_INDEX_MAGIC;
 }
+
+
+#pragma mark SORTED EXTRACT
+
+/* Return the file extension (including the dot) from the last path component.
+ * Returns an empty string if there is no extension. */
+static const char *file_type_ext(const char *name) {
+    if (!name) return "";
+    const char *slash = strrchr(name, '/');
+    const char *base  = slash ? slash + 1 : name;
+    const char *dot   = strrchr(base, '.');
+    return dot ? dot : "";
+}
+
+static int cmp_sorted_files(const void *a, const void *b) {
+    const file_index_t * const *fa = (const file_index_t * const *)a;
+    const file_index_t * const *fb = (const file_index_t * const *)b;
+    int r = strcmp(file_type_ext((*fa)->name), file_type_ext((*fb)->name));
+    if (r != 0) return r;
+    return strcmp((*fa)->name, (*fb)->name);
+}
+
+/* Load the pixz index once, sort it by file type (extension) then by filename,
+ * and write the tar entries (headers + data) to gOutFile in that new order. */
+void pixz_sorted_extract(void) {
+    if (!decode_index())
+        die("Can't perform sorted extract on non-seekable input");
+
+    lzma_vli file_index_offset = read_file_index();
+    if (!file_index_offset)
+        die("No file index found - not a tar archive");
+
+    /* Count non-sentinel entries (sentinel has name == NULL). */
+    size_t count = 0;
+    for (file_index_t *f = gFileIndex; f && f->name; f = f->next)
+        ++count;
+
+    if (count == 0) {
+        free_file_index();
+        lzma_index_end(gIndex, NULL);
+        return;
+    }
+
+    /* Build an array of pointers into the file index, then sort it. */
+    file_index_t **sorted = xmalloc(count * sizeof(file_index_t *));
+    size_t i = 0;
+    for (file_index_t *f = gFileIndex; f && f->name; f = f->next)
+        sorted[i++] = f;
+    qsort(sorted, count, sizeof(file_index_t *), cmp_sorted_files);
+
+    /* Parallel arrays: uncompressed start offsets, byte sizes, output buffers. */
+    off_t    *starts = xmalloc(count * sizeof(off_t));
+    size_t   *sizes  = xmalloc(count * sizeof(size_t));
+    uint8_t **bufs   = xmalloc(count * sizeof(uint8_t *));
+
+    for (i = 0; i < count; ++i) {
+        starts[i] = sorted[i]->offset;
+        sizes[i]  = (size_t)(sorted[i]->next->offset - sorted[i]->offset);
+        bufs[i]   = xmalloc(sizes[i]);
+    }
+
+    /* Walk every lzma block in the archive.  For each block that overlaps at
+     * least one wanted file, decompress it and copy the relevant byte ranges
+     * into the per-file buffers. */
+    lzma_index_iter iter;
+    lzma_index_iter_init(&iter, gIndex);
+    while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK)) {
+        /* Skip the pixz file-index block itself. */
+        if (iter.block.compressed_file_offset == file_index_offset)
+            continue;
+
+        off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
+        off_t blk_uend   = blk_ustart + (off_t)iter.block.uncompressed_size;
+
+        /* Does this block overlap any wanted file? */
+        bool needed = false;
+        for (size_t j = 0; j < count; ++j) {
+            if (starts[j] < blk_uend &&
+                    (off_t)(starts[j] + (off_t)sizes[j]) > blk_ustart) {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) continue;
+
+        /* Seek to the compressed block and read its header. */
+        if (fseeko(gInFile, (off_t)iter.block.compressed_file_offset,
+                   SEEK_SET) == -1)
+            die("Error seeking to block");
+
+        int hb = fgetc(gInFile);
+        if (hb == EOF || hb == 0)
+            die("Error reading block header byte");
+
+        lzma_filter filters[LZMA_FILTERS_MAX + 1];
+        lzma_block block = { .filters = filters,
+                             .check   = iter.stream.flags->check,
+                             .version = 0 };
+        block.header_size = lzma_block_header_size_decode(hb);
+
+        uint8_t hdrbuf[LZMA_BLOCK_HEADER_SIZE_MAX];
+        hdrbuf[0] = (uint8_t)hb;
+        if (fread(hdrbuf + 1, block.header_size - 1, 1, gInFile) != 1)
+            die("Error reading block header");
+        if (lzma_block_header_decode(&block, NULL, hdrbuf) != LZMA_OK)
+            die("Error decoding block header");
+
+        /* Decompress the entire block into a temporary buffer. */
+        size_t outsize = (size_t)iter.block.uncompressed_size;
+        uint8_t *output = xmalloc(outsize);
+
+        lzma_stream stream = LZMA_STREAM_INIT;
+        if (lzma_block_decoder(&stream, &block) != LZMA_OK)
+            die("Error creating block decoder");
+        stream.next_out  = output;
+        stream.avail_out = outsize;
+
+        uint8_t ibuf[CHUNKSIZE];
+        lzma_ret err = LZMA_OK;
+        while (err != LZMA_STREAM_END) {
+            if (err != LZMA_OK)
+                die("Error decoding block data");
+            if (stream.avail_in == 0) {
+                stream.avail_in = fread(ibuf, 1, sizeof(ibuf), gInFile);
+                if (ferror(gInFile))
+                    die("Error reading block data");
+                stream.next_in = ibuf;
+            }
+            err = lzma_code(&stream, LZMA_RUN);
+        }
+        lzma_end(&stream);
+
+        /* Copy the relevant byte ranges from this block into file buffers. */
+        for (size_t j = 0; j < count; ++j) {
+            off_t fend = starts[j] + (off_t)sizes[j];
+            if (starts[j] >= blk_uend || fend <= blk_ustart)
+                continue;
+            off_t cstart = starts[j] > blk_ustart ? starts[j] : blk_ustart;
+            off_t cend   = fend < blk_uend         ? fend       : blk_uend;
+            size_t csz   = (size_t)(cend - cstart);
+            memcpy(bufs[j]  + (size_t)(cstart - starts[j]),
+                   output   + (size_t)(cstart - blk_ustart),
+                   csz);
+        }
+
+        free(output);
+    }
+
+    /* The sentinel offset includes the original tar's end-of-archive zero
+     * blocks, so the entry that is last in archive order has a size larger
+     * than its actual tar entry.  Trim those trailing zero bytes so they
+     * don't appear mid-stream when that entry is not last in sorted order.
+     * Scan backwards for the last non-zero byte, then round up to the next
+     * 512-byte tar block boundary. */
+    for (i = 0; i < count; ++i) {
+        if (sorted[i]->next->name == NULL) {
+            ssize_t last_nz = (ssize_t)sizes[i] - 1;
+            while (last_nz >= 0 && bufs[i][last_nz] == 0)
+                --last_nz;
+            sizes[i] = last_nz < 0 ? 0
+                : (size_t)(last_nz + 1 + 511) / 512 * 512;
+            break;
+        }
+    }
+
+    /* Write all files to gOutFile in sorted order. */
+    for (i = 0; i < count; ++i) {
+        if (fwrite(bufs[i], sizes[i], 1, gOutFile) != 1)
+            die("Error writing sorted output");
+        free(bufs[i]);
+    }
+
+    /* Write the tar end-of-archive marker: two 512-byte zero blocks. */
+    uint8_t tar_eof[1024];
+    memset(tar_eof, 0, sizeof(tar_eof));
+    if (fwrite(tar_eof, sizeof(tar_eof), 1, gOutFile) != 1)
+        die("Error writing tar EOF");
+
+    free(sorted);
+    free(starts);
+    free(sizes);
+    free(bufs);
+    free_file_index();
+    lzma_index_end(gIndex, NULL);
+}
+

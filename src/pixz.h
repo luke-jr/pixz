@@ -50,6 +50,7 @@
 void pixz_list(bool tar);
 void pixz_write(bool tar, uint32_t level);
 void pixz_read(bool verify, size_t nspecs, char **specs);
+void pixz_sorted_extract(void);
 
 
 #pragma mark UTILS

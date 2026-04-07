@@ -3,7 +3,8 @@ TESTS = \
 	cppcheck-src.sh \
 	single-file-round-trip.sh \
 	xz-compatibility-c-option.sh \
-	concatenated-small-files.sh
+	concatenated-small-files.sh \
+	sorted-extract.sh
 
 EXTRA_DIST = $(TESTS)
 

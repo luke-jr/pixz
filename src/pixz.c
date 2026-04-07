@@ -8,7 +8,8 @@ typedef enum {
     OP_WRITE,
     OP_READ,
     OP_EXTRACT,
-    OP_LIST
+    OP_LIST,
+    OP_SORT_EXTRACT
 } pixz_op_t;
 
 static bool strsuf(char *big, char *small);
@@ -31,6 +32,7 @@ static void usage(const char *msg) {
 "  pixz -d input.tpxz output.tar   # Decompress\n"
 "  pixz -l input.tpxz              # List tarball contents very fast\n"
 "  pixz -x path/to/file < input.tpxz | tar x  # Extract one file very fast\n"
+"  pixz -S input.tpxz | tar x      # Extract sorted by file type then name\n"
 "  tar -Ipixz -cf output.tpxz dir  # Make tar use pixz automatically\n"
 "\n"
 "Input and output:\n"
@@ -44,6 +46,7 @@ static void usage(const char *msg) {
 "  -t                 Don't assume input is in tar format\n"
 "  -k                 Keep original input (do not remove it)\n"
 "  -c                 ignored\n"
+"  -S                 Extract sorted by file type then filename\n"
 "  -V                 Print version and exit\n"
 "  -h                 Print this help\n"
 "\n"
@@ -74,12 +77,13 @@ int main(int argc, char **argv) {
 	char *optend;
 	long optint;
     double optdbl;
-    while ((ch = getopt(argc, argv, "dcxli:o:tkvVhp:0123456789f:q:e")) != -1) {
+    while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:e")) != -1) {
         switch (ch) {
             case 'c': break;
             case 'd': op = OP_READ; break;
             case 'x': op = OP_EXTRACT; break;
             case 'l': op = OP_LIST; break;
+            case 'S': op = OP_SORT_EXTRACT; break;
             case 'i': ipath = optarg; break;
             case 'o': opath = optarg; break;
             case 't': tar = false; break;
@@ -130,7 +134,7 @@ int main(int argc, char **argv) {
             if (opath)
                 usage("Multiple output files specified");
             opath = argv[1];
-        } else if (op != OP_LIST) {
+        } else if (op != OP_LIST && op != OP_SORT_EXTRACT) {
             iremove = true;
             opath = auto_output(op, argv[0]);
 			if (!opath)
@@ -180,7 +184,8 @@ int main(int argc, char **argv) {
 			break;
         case OP_READ: pixz_read(tar, 0, NULL); break;
         case OP_EXTRACT: pixz_read(tar, argc, argv); break;
-        case OP_LIST: pixz_list(tar);
+        case OP_LIST: pixz_list(tar); break;
+        case OP_SORT_EXTRACT: pixz_sorted_extract(); break;
     }
     
     if (iremove && !keep_input)
