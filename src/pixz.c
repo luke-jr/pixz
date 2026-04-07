@@ -33,7 +33,7 @@ static void usage(const char *msg) {
 "  pixz -l input.tpxz              # List tarball contents very fast\n"
 "  pixz -x path/to/file < input.tpxz | tar x  # Extract one file very fast\n"
 "  pixz -S input.tpxz | tar x      # Extract sorted for best re-compression\n"
-"  pixz -S -D 64M input.tpxz | pixz > out.tpxz  # Re-compress with 64 MiB dict\n"
+"  pixz -S -D 64M input.tpxz | pixz -9 > out.tpxz  # Re-compress with 64M dict\n"
 "  tar -Ipixz -cf output.tpxz dir  # Make tar use pixz automatically\n"
 "\n"
 "Input and output:\n"
@@ -49,7 +49,8 @@ static void usage(const char *msg) {
 "  -c                 ignored\n"
 "  -S                 Extract sorted by file type then filename (for re-compression)\n"
 "  -D SIZE            Dictionary size of the recompressor (used with -S);\n"
-"                     SIZE is in bytes with optional K/M/G suffix (default: 8M)\n"
+"                     SIZE is in bytes with optional K/M/G suffix\n"
+"                     (default: matches liblzma default preset)\n"
 "  -V                 Print version and exit\n"
 "  -h                 Print this help\n"
 "\n"
@@ -80,6 +81,7 @@ int main(int argc, char **argv) {
 	char *optend;
 	long optint;
     double optdbl;
+    bool sort_dict_set = false;
     while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:eD:")) != -1) {
         switch (ch) {
             case 'c': break;
@@ -92,12 +94,16 @@ int main(int argc, char **argv) {
                 unsigned long val = strtoul(optarg, &end, 10);
                 if (end == optarg || val == 0)
                     usage("Need a positive integer argument to -D");
-                if (*end == 'K' || *end == 'k') { val *= 1024UL; ++end; }
-                else if (*end == 'M' || *end == 'm') { val *= 1024UL * 1024; ++end; }
-                else if (*end == 'G' || *end == 'g') { val *= 1024UL * 1024 * 1024; ++end; }
+                unsigned long mult = 1;
+                if (*end == 'K' || *end == 'k') { mult = 1024UL; ++end; }
+                else if (*end == 'M' || *end == 'm') { mult = 1024UL * 1024; ++end; }
+                else if (*end == 'G' || *end == 'g') { mult = 1024UL * 1024 * 1024; ++end; }
                 if (*end)
                     usage("Invalid suffix for -D; use K, M, or G");
-                gSortDictSize = (size_t)val;
+                if (mult > 1 && val > (unsigned long)(SIZE_MAX / mult))
+                    usage("Value too large for -D");
+                gSortDictSize = (size_t)(val * mult);
+                sort_dict_set = true;
                 break;
             }
             case 'i': ipath = optarg; break;
@@ -135,7 +141,17 @@ int main(int argc, char **argv) {
     }
     argc -= optind;
     argv += optind;
-        
+
+    if (sort_dict_set && op != OP_SORT_EXTRACT)
+        usage("-D is only meaningful with -S");
+
+    /* Default dict size: ask liblzma what LZMA_PRESET_DEFAULT uses. */
+    if (!sort_dict_set) {
+        lzma_options_lzma lzma_opt;
+        if (lzma_lzma_preset(&lzma_opt, LZMA_PRESET_DEFAULT) == 0)
+            gSortDictSize = lzma_opt.dict_size;
+    }
+
     gInFile = stdin;
     gOutFile = stdout;
     bool iremove = false;    
