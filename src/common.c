@@ -12,6 +12,7 @@
 
 FILE *gInFile = NULL, *gOutFile = NULL;
 lzma_stream gStream = LZMA_STREAM_INIT;
+bool gVerbose = false;
 
 
 void die(const char *fmt, ...) {

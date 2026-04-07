@@ -60,6 +60,8 @@ extern lzma_stream gStream;
 
 extern lzma_index *gIndex;
 
+extern bool gVerbose;
+
 
 void die(const char *fmt, ...);
 char *xstrdup(const char *s);

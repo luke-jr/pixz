@@ -1342,6 +1342,9 @@ void pixz_sorted_extract(void) {
             tail_zeros = sizes[i] - write_size;
         }
 
+        if (gVerbose && sorted[i]->name)
+            fprintf(stderr, "%s\n", sorted[i]->name);
+
         if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
             die("Error writing sorted output");
 
@@ -1359,9 +1362,10 @@ void pixz_sorted_extract(void) {
         free(tar_eof);
     }
 
-    debug("sorted-extract stats: decompressions=%zu  cache_hits=%zu"
-          "  redecompressions=%zu",
-          stats.decompressions, stats.cache_hits, stats.redecompressions);
+    if (gVerbose)
+        fprintf(stderr, "sorted-extract stats: decompressions=%zu  cache_hits=%zu"
+                "  redecompressions=%zu\n",
+                stats.decompressions, stats.cache_hits, stats.redecompressions);
 
     bc_free(&cache);
     lu_free(&lu);

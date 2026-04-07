@@ -48,6 +48,7 @@ static void usage(const char *msg) {
 "  -k                 Keep original input (do not remove it)\n"
 "  -c                 ignored\n"
 "  -S                 Extract sorted by file type then filename (for re-compression)\n"
+"  -S -l              Same, but list each file and print cache stats to stderr\n"
 "  -D SIZE            Dictionary size of the recompressor (used with -S);\n"
 "                     SIZE is in bytes with optional K/M/G suffix\n"
 "                     (default: matches liblzma default preset)\n"
@@ -87,8 +88,17 @@ int main(int argc, char **argv) {
             case 'c': break;
             case 'd': op = OP_READ; break;
             case 'x': op = OP_EXTRACT; break;
-            case 'l': op = OP_LIST; break;
-            case 'S': op = OP_SORT_EXTRACT; break;
+            case 'l':
+                if (op == OP_SORT_EXTRACT)
+                    gVerbose = true;
+                else
+                    op = OP_LIST;
+                break;
+            case 'S':
+                if (op == OP_LIST)
+                    gVerbose = true;
+                op = OP_SORT_EXTRACT;
+                break;
             case 'D': {
                 char *end;
                 unsigned long val = strtoul(optarg, &end, 10);
