@@ -1241,6 +1241,13 @@ void pixz_sorted_extract(void) {
     uint8_t *fbuf     = NULL;
     size_t   fbuf_cap = 0;
 
+    /* tail_zeros: the number of trailing zero bytes to write after all sorted
+     * entries.  This equals the original archive's trailing region (two-block
+     * EOF marker plus any blocking-factor padding), so the output is exactly
+     * the same size as the input tar.  Default to the minimum valid EOF if
+     * last_in_archive_sorted_idx is not found (shouldn't happen). */
+    size_t tail_zeros = TAR_BLOCK_SIZE * 2;
+
     for (i = 0; i < count; ++i) {
         /* Grow the per-file working buffer on demand. */
         if (sizes[i] > fbuf_cap) {
@@ -1253,10 +1260,10 @@ void pixz_sorted_extract(void) {
                       fio, &cache, &lu, i);
 
         /* The entry that is last in archive order carries trailing tar
-         * end-of-archive zeros in its size.  Trim those zeros so they
-         * do not appear in the middle of the sorted output stream.
-         * Scan backwards for the last non-zero byte, then round up to
-         * the next TAR_BLOCK_SIZE boundary. */
+         * end-of-archive zeros in its size (two-block EOF marker plus any
+         * blocking-factor padding added by tar).  Trim those zeros so they
+         * do not appear in the middle of the sorted output stream, and record
+         * how many were trimmed so we can restore them at the end. */
         size_t write_size = sizes[i];
         if (i == last_in_archive_sorted_idx) {
             ssize_t last_nz = (ssize_t)write_size - 1;
@@ -1264,6 +1271,10 @@ void pixz_sorted_extract(void) {
                 --last_nz;
             write_size = last_nz < 0 ? 0
                 : ROUND_UP_TO_TAR_BLOCK((size_t)last_nz + 1);
+            /* Preserve original trailing-zero count (>= 1024 for valid tar).*/
+            tail_zeros = sizes[i] - write_size;
+            if (tail_zeros < TAR_BLOCK_SIZE * 2)
+                tail_zeros = TAR_BLOCK_SIZE * 2;
         }
 
         if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
@@ -1273,11 +1284,14 @@ void pixz_sorted_extract(void) {
         bc_evict_done(&cache, i);
     }
 
-    /* Write the tar end-of-archive marker: two TAR_BLOCK_SIZE zero blocks. */
-    uint8_t tar_eof[TAR_BLOCK_SIZE * 2];
-    memset(tar_eof, 0, sizeof(tar_eof));
-    if (fwrite(tar_eof, sizeof(tar_eof), 1, gOutFile) != 1)
+    /* Write the tar end-of-archive zeros.  We use the same count as the
+     * original archive so the output size matches exactly (this preserves the
+     * blocking-factor padding that tar adds beyond the two EOF blocks). */
+    uint8_t *tar_eof = xmalloc(tail_zeros);
+    memset(tar_eof, 0, tail_zeros);
+    if (fwrite(tar_eof, tail_zeros, 1, gOutFile) != 1)
         die("Error writing tar EOF");
+    free(tar_eof);
 
     bc_free(&cache);
     lu_free(&lu);

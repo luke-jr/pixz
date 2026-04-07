@@ -82,4 +82,14 @@ for name in alpha.c beta.c main.h notes.txt readme.txt Makefile subdir/sub.c; do
     fi
 done
 
+# Verify that the sorted output is the same size as the original tar.
+# GNU tar pads archives to a multiple of the blocking factor (default 10240
+# bytes); that trailing padding must be preserved so the output size matches.
+ORIG_SIZE=$(wc -c < "$TAR_FILE")
+SORTED_SIZE=$(wc -c < "$SORTED_TAR")
+if [ "$ORIG_SIZE" != "$SORTED_SIZE" ]; then
+    echo "FAIL: size mismatch: original=$ORIG_SIZE sorted=$SORTED_SIZE"
+    exit 1
+fi
+
 exit 0
