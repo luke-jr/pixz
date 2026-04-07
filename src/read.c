@@ -730,12 +730,31 @@ static int cmp_sorted_files(const void *a, const void *b) {
     const char *na = (*fa)->name ? (*fa)->name : "";
     const char *nb = (*fb)->name ? (*fb)->name : "";
 
+    off_t sa = (*fa)->next->offset - (*fa)->offset;
+    off_t sb = (*fb)->next->offset - (*fb)->offset;
+
+    /* Tier 0: header-only entries (directories, symlinks, hard links,
+     * devices, FIFOs, and 0-byte regular files — all exactly one 512-byte
+     * tar header block with no data blocks) sort FIRST.
+     *
+     * In a typical tar archive a directory entry appears immediately before
+     * the files it contains, so the directory shares its lzma block with
+     * those files.  Sorting directories first means the directory is always
+     * an *early* consumer of the block; lu_last_user is determined by the
+     * normal files in the block and is unchanged from the no-directory case.
+     * Sorting directories last would make every such block stay in the cache
+     * for the entire sort (lu_last_user = count-1), inflating cache pressure
+     * with no benefit. */
+    int ha = (sa <= TAR_BLOCK_SIZE);
+    int hb = (sb <= TAR_BLOCK_SIZE);
+    if (ha != hb) return hb - ha;   /* 1 (header-only) sorts before 0 */
+
     /* Primary: small files (< dict size) sort before large files.
      * Large files flush the LZMA dictionary entirely on their own, so they
      * gain nothing from adjacency to other files; isolating them prevents them
      * from breaking up runs of compressible content. */
-    int la = ((*fa)->next->offset - (*fa)->offset) >= (off_t)gSortDictSize;
-    int lb = ((*fb)->next->offset - (*fb)->offset) >= (off_t)gSortDictSize;
+    int la = (sa >= (off_t)gSortDictSize);
+    int lb = (sb >= (off_t)gSortDictSize);
     if (la != lb) return la - lb;   /* 0 (small) sorts before 1 (large) */
 
     /* Secondary: group globally by extension.  This keeps all .c files
@@ -1122,10 +1141,15 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
 /* Load the pixz index once, sort the files, and write the tar entries
  * (headers + data) to gOutFile in that new order.
  *
- * Sort key: (is_large, extension, directory, name).
- *   is_large   – files >= LARGE_FILE_THRESHOLD go last; they flush the LZMA
- *                dictionary entirely on their own and gain nothing from
- *                adjacency to other files.
+ * Sort key: (is_header_only, is_large, extension, directory, name).
+ *   is_header_only – dirs, symlinks, hard links, devices, FIFOs, and 0-byte
+ *                files (span <= 512 bytes) sort first.  In a typical tar such
+ *                entries immediately precede the files they contain, sharing
+ *                an lzma block with them.  Sorting them first keeps them as
+ *                early (not late) consumers of shared blocks, so lu_last_user
+ *                is unaffected and cache pressure is minimised.
+ *   is_large   – files >= dict_size go last; they flush the LZMA dictionary
+ *                entirely on their own and gain nothing from adjacency.
  *   extension  – groups globally similar types (all .c together, all .py
  *                together), giving LZMA a rich shared dictionary per type.
  *   directory  – within the same type, same-directory files share

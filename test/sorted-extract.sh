@@ -1,5 +1,7 @@
 #!/bin/sh
-# Test that -S extracts files sorted by file type (extension) then filename.
+# Test that -S extracts files sorted by file type (extension) then filename,
+# and that header-only entries (directories, 0-byte files) sort before all
+# regular files.
 
 PIXZ=../src/pixz
 
@@ -21,13 +23,18 @@ printf 'notes\n'   > "$NOTES_TXT"
 printf 'readme\n'  > "$README_TXT"
 printf 'build\n'   > "$MAKEFILE"
 
+# Add a sub-directory to verify that header-only entries sort first.
+mkdir -p "$TMPDIR/subdir"
+printf 'sub\n' > "$TMPDIR/subdir/sub.c"
+
 TAR_FILE=$TMPDIR/test.tar
 PIXZ_FILE=$TMPDIR/test.tpxz
 SORTED_TAR=$TMPDIR/sorted.tar
 
 # Build tar in an order that differs from the sorted result.
-# Archive order: readme.txt, main.h, Makefile, alpha.c, notes.txt, beta.c
-tar cf "$TAR_FILE" -C "$TMPDIR" readme.txt main.h Makefile alpha.c notes.txt beta.c
+# Archive order: readme.txt, main.h, Makefile, alpha.c, notes.txt, beta.c,
+#                subdir/ (directory entry), subdir/sub.c
+tar cf "$TAR_FILE" -C "$TMPDIR" readme.txt main.h Makefile alpha.c notes.txt beta.c subdir
 
 $PIXZ "$TAR_FILE" "$PIXZ_FILE"
 
@@ -36,14 +43,18 @@ $PIXZ -S "$PIXZ_FILE" > "$SORTED_TAR"
 # List files in the sorted tar and collect their names in order.
 ACTUAL=$(tar tf "$SORTED_TAR" 2>&1)
 
-# Expected sort: by extension (empty < .c < .h < .txt), then by name.
-#   No extension: Makefile
-#   .c:           alpha.c, beta.c
-#   .h:           main.h
-#   .txt:         notes.txt, readme.txt
-EXPECTED="Makefile
+# Expected sort:
+#   Tier 0 (header-only): subdir/           <- directory entry, no data
+#   Tier 1 small files by extension then name:
+#     no extension: Makefile
+#     .c:           alpha.c, beta.c, subdir/sub.c
+#     .h:           main.h
+#     .txt:         notes.txt, readme.txt
+EXPECTED="subdir/
+Makefile
 alpha.c
 beta.c
+subdir/sub.c
 main.h
 notes.txt
 readme.txt"
@@ -62,7 +73,7 @@ EXTRACT_DIR=$TMPDIR/extracted
 mkdir -p "$EXTRACT_DIR"
 tar xf "$SORTED_TAR" -C "$EXTRACT_DIR"
 
-for name in alpha.c beta.c main.h notes.txt readme.txt Makefile; do
+for name in alpha.c beta.c main.h notes.txt readme.txt Makefile subdir/sub.c; do
     ORIG=$(cat "$TMPDIR/$name")
     EXTR=$(cat "$EXTRACT_DIR/$name")
     if [ "$ORIG" != "$EXTR" ]; then
