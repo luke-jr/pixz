@@ -777,7 +777,7 @@ void pixz_sorted_extract(void) {
         bool needed = false;
         for (size_t j = 0; j < count; ++j) {
             if (starts[j] < blk_uend &&
-                    (off_t)(starts[j] + (off_t)sizes[j]) > blk_ustart) {
+                    starts[j] + (off_t)sizes[j] > blk_ustart) {
                 needed = true;
                 break;
             }
@@ -792,6 +792,9 @@ void pixz_sorted_extract(void) {
         int hb = fgetc(gInFile);
         if (hb == EOF || hb == 0)
             die("Error reading block header byte");
+
+        if (!iter.stream.flags)
+            die("Missing stream flags for block");
 
         lzma_filter filters[LZMA_FILTERS_MAX + 1];
         lzma_block block = { .filters = filters,
