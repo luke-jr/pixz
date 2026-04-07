@@ -704,6 +704,8 @@ static bool taste_file_index(io_block_t *ib) {
 #pragma mark SORTED EXTRACT
 
 #define TAR_BLOCK_SIZE  512     /* size of one tar header/data block in bytes */
+#define ROUND_UP_TO_TAR_BLOCK(n) \
+    (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
 /* Return the file extension (including the dot) from the last path component.
  * Returns an empty string if there is no extension. */
@@ -1033,12 +1035,15 @@ void pixz_sorted_extract(void) {
         sizes[i]  = (size_t)(sorted[i]->next->offset - sorted[i]->offset);
     }
 
-    /* Find the entry that is last in archive order; its size includes the
-     * original tar end-of-archive zeros and must be trimmed on output.
+    /* Find the position in the sorted array of the file that was last in the
+     * original archive order.  Its raw size includes the original tar
+     * end-of-archive zeros and must be trimmed before writing.
      * Use count as a sentinel meaning "not found". */
-    size_t last_archive_idx = count;
+    size_t last_in_archive_sorted_idx = count;
     for (size_t j = 0; j < count; ++j) {
-        if (sorted[j]->next->name == NULL) { last_archive_idx = j; break; }
+        if (sorted[j]->next->name == NULL) {
+            last_in_archive_sorted_idx = j; break;
+        }
     }
 
     /* Precompute last_user for every lzma block.
@@ -1091,13 +1096,12 @@ void pixz_sorted_extract(void) {
          * Scan backwards for the last non-zero byte, then round up to
          * the next TAR_BLOCK_SIZE boundary. */
         size_t write_size = sizes[i];
-        if (i == last_archive_idx) {
+        if (i == last_in_archive_sorted_idx) {
             ssize_t last_nz = (ssize_t)write_size - 1;
             while (last_nz >= 0 && fbuf[last_nz] == 0)
                 --last_nz;
             write_size = last_nz < 0 ? 0
-                : (size_t)(last_nz + TAR_BLOCK_SIZE) / TAR_BLOCK_SIZE
-                    * TAR_BLOCK_SIZE;
+                : ROUND_UP_TO_TAR_BLOCK((size_t)last_nz + 1);
         }
 
         if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
