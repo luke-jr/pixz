@@ -33,6 +33,7 @@ static void usage(const char *msg) {
 "  pixz -l input.tpxz              # List tarball contents very fast\n"
 "  pixz -x path/to/file < input.tpxz | tar x  # Extract one file very fast\n"
 "  pixz -S input.tpxz | tar x      # Extract sorted for best re-compression\n"
+"  pixz -S -D 64M input.tpxz | pixz > out.tpxz  # Re-compress with 64 MiB dict\n"
 "  tar -Ipixz -cf output.tpxz dir  # Make tar use pixz automatically\n"
 "\n"
 "Input and output:\n"
@@ -46,7 +47,9 @@ static void usage(const char *msg) {
 "  -t                 Don't assume input is in tar format\n"
 "  -k                 Keep original input (do not remove it)\n"
 "  -c                 ignored\n"
-"  -S                 Extract sorted by directory, file type, then filename\n"
+"  -S                 Extract sorted by file type then filename (for re-compression)\n"
+"  -D SIZE            Dictionary size of the recompressor (used with -S);\n"
+"                     SIZE is in bytes with optional K/M/G suffix (default: 8M)\n"
 "  -V                 Print version and exit\n"
 "  -h                 Print this help\n"
 "\n"
@@ -77,13 +80,26 @@ int main(int argc, char **argv) {
 	char *optend;
 	long optint;
     double optdbl;
-    while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:e")) != -1) {
+    while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:eD:")) != -1) {
         switch (ch) {
             case 'c': break;
             case 'd': op = OP_READ; break;
             case 'x': op = OP_EXTRACT; break;
             case 'l': op = OP_LIST; break;
             case 'S': op = OP_SORT_EXTRACT; break;
+            case 'D': {
+                char *end;
+                unsigned long val = strtoul(optarg, &end, 10);
+                if (end == optarg || val == 0)
+                    usage("Need a positive integer argument to -D");
+                if (*end == 'K' || *end == 'k') { val *= 1024UL; ++end; }
+                else if (*end == 'M' || *end == 'm') { val *= 1024UL * 1024; ++end; }
+                else if (*end == 'G' || *end == 'g') { val *= 1024UL * 1024 * 1024; ++end; }
+                if (*end)
+                    usage("Invalid suffix for -D; use K, M, or G");
+                gSortDictSize = (size_t)val;
+                break;
+            }
             case 'i': ipath = optarg; break;
             case 'o': opath = optarg; break;
             case 't': tar = false; break;

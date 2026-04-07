@@ -717,57 +717,12 @@ static const char *file_type_ext(const char *name) {
     return dot ? dot : "";
 }
 
-/* Files at least this large flush the entire LZMA dictionary on their own.
- * Populated from the actual block headers before sorting; falls back to
- * 8 MiB (the level-6 default) if the dict size cannot be determined. */
-static size_t gSortDictSize = 8 * 1024 * 1024;
-
-/* Read the LZMA dictionary size from the first data block in the stream.
- * fio is the compressed offset of the pixz file-index block (to be skipped).
- * Returns 0 if no suitable block is found (caller should keep the default). */
-static size_t read_lzma_dict_size(lzma_vli fio) {
-    lzma_index_iter iter;
-    lzma_index_iter_init(&iter, gIndex);
-    while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK)) {
-        if (iter.block.compressed_file_offset == fio)
-            continue;
-        if (!iter.stream.flags)
-            continue;
-
-        if (fseeko(gInFile, (off_t)iter.block.compressed_file_offset,
-                   SEEK_SET) == -1)
-            break;
-        int hb = fgetc(gInFile);
-        if (hb == EOF || hb == 0)
-            break;
-
-        lzma_filter filters[LZMA_FILTERS_MAX + 1];
-        lzma_block block = { .filters = filters,
-                             .check = iter.stream.flags->check,
-                             .version = 0 };
-        block.header_size = lzma_block_header_size_decode(hb);
-
-        uint8_t hdrbuf[LZMA_BLOCK_HEADER_SIZE_MAX];
-        hdrbuf[0] = (uint8_t)hb;
-        if (fread(hdrbuf + 1, block.header_size - 1, 1, gInFile) != 1)
-            break;
-        if (lzma_block_header_decode(&block, NULL, hdrbuf) != LZMA_OK)
-            break;
-
-        size_t dict_size = 0;
-        for (int i = 0; filters[i].id != LZMA_VLI_UNKNOWN; i++) {
-            if (filters[i].id == LZMA_FILTER_LZMA2 ||
-                    filters[i].id == LZMA_FILTER_LZMA1) {
-                dict_size =
-                    ((lzma_options_lzma *)filters[i].options)->dict_size;
-                break;
-            }
-        }
-        lzma_filters_free(filters, NULL);
-        return dict_size;
-    }
-    return 0;
-}
+/* Dictionary size of the *recompressor* that will consume the sorted output.
+ * Files larger than this threshold flush a full dictionary window on their own
+ * and gain nothing from adjacency; they are sorted last to avoid disrupting
+ * runs of compressible small files.  Default is 8 MiB (xz/pixz level -6).
+ * Set via the -D command-line option to match the intended recompressor. */
+size_t gSortDictSize = 8 * 1024 * 1024;
 
 static int cmp_sorted_files(const void *a, const void *b) {
     const file_index_t * const *fa = (const file_index_t * const *)a;
@@ -1207,9 +1162,6 @@ void pixz_sorted_extract(void) {
     size_t i = 0;
     for (file_index_t *f = gFileIndex; f && f->name; f = f->next)
         sorted[i++] = f;
-    size_t dict_size = read_lzma_dict_size(fio);
-    if (dict_size > 0)
-        gSortDictSize = dict_size;
     qsort(sorted, count, sizeof(file_index_t *), cmp_sorted_files);
 
     off_t  *starts = xmalloc(count * sizeof(off_t));
