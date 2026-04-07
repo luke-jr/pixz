@@ -1242,13 +1242,13 @@ void pixz_sorted_extract(void) {
     size_t   fbuf_cap = 0;
 
     /* tail_zeros: the number of trailing zero bytes to write after all sorted
-     * entries.  This equals the original archive's trailing region so the
-     * output is byte-for-byte the same size as the input tar.  Some archives
-     * omit a proper EOF marker entirely; we reproduce whatever tail was
-     * present, even if it is shorter than the standard 1024 bytes.
-     * Defaults to 0 if last_in_archive_sorted_idx is not found (shouldn't
-     * happen in practice). */
-    size_t tail_zeros = 0;
+     * entries.  The tar standard requires at least two 512-byte zero blocks
+     * (1024 bytes) as an end-of-archive marker, so we always write at least
+     * that many.  If the last-in-archive entry's trailing region is larger
+     * (e.g. blocking-factor padding), we preserve the larger value.
+     * Defaults to TAR_BLOCK_SIZE*2 if last_in_archive_sorted_idx is not
+     * found (shouldn't happen in practice). */
+    size_t tail_zeros = TAR_BLOCK_SIZE * 2;
 
     for (i = 0; i < count; ++i) {
         /* Grow the per-file working buffer on demand. */
@@ -1307,6 +1307,8 @@ void pixz_sorted_extract(void) {
 
             write_size = (pos <= sizes[i]) ? pos : sizes[i];
             tail_zeros = sizes[i] - write_size;
+            if (tail_zeros < TAR_BLOCK_SIZE * 2)
+                tail_zeros = TAR_BLOCK_SIZE * 2;
         }
 
         if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
@@ -1316,16 +1318,14 @@ void pixz_sorted_extract(void) {
         bc_evict_done(&cache, i);
     }
 
-    /* Write the tar end-of-archive zeros.  We reproduce exactly the same
-     * number of trailing zero bytes as the original archive (which may be
-     * zero for truncated/non-conformant archives). */
-    if (tail_zeros > 0) {
-        uint8_t *tar_eof = xmalloc(tail_zeros);
-        memset(tar_eof, 0, tail_zeros);
-        if (fwrite(tar_eof, tail_zeros, 1, gOutFile) != 1)
-            die("Error writing tar EOF");
-        free(tar_eof);
-    }
+    /* Write the tar end-of-archive zeros.  Always at least TAR_BLOCK_SIZE*2
+     * bytes to produce a standards-compliant EOF marker; more if the original
+     * archive had additional blocking-factor padding. */
+    uint8_t *tar_eof = xmalloc(tail_zeros);
+    memset(tar_eof, 0, tail_zeros);
+    if (fwrite(tar_eof, tail_zeros, 1, gOutFile) != 1)
+        die("Error writing tar EOF");
+    free(tar_eof);
 
     bc_free(&cache);
     lu_free(&lu);
