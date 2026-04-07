@@ -721,14 +721,283 @@ static int cmp_sorted_files(const void *a, const void *b) {
     return strcmp((*fa)->name, (*fb)->name);
 }
 
-/* Load the pixz index once, sort it by file type (extension) then by filename,
- * and write the tar entries (headers + data) to gOutFile in that new order. */
+
+/* ---- last-user lookup table -------------------------------------------
+ *
+ * Maps lzma block compressed-offset → the highest sorted-order file index
+ * that overlaps that block.  Used to decide when a cached block can be
+ * proactively evicted.
+ */
+
+#define LU_HASH_BITS 8
+#define LU_HASH_SIZE (1 << LU_HASH_BITS)
+#define LU_HASH_MASK (LU_HASH_SIZE - 1)
+
+typedef struct lu_entry_t lu_entry_t;
+struct lu_entry_t {
+    lzma_vli   comp_off;
+    size_t     last_user;   /* sorted-order index of last file using block */
+    lu_entry_t *next;       /* hash-chain */
+};
+
+typedef struct { lu_entry_t *b[LU_HASH_SIZE]; } lu_table_t;
+
+static void lu_init(lu_table_t *t) { memset(t, 0, sizeof(*t)); }
+
+/* Always overwrites; caller guarantees user values are non-decreasing. */
+static void lu_set(lu_table_t *t, lzma_vli off, size_t user) {
+    size_t h = (size_t)(off >> 3) & LU_HASH_MASK;
+    for (lu_entry_t *e = t->b[h]; e; e = e->next) {
+        if (e->comp_off == off) { e->last_user = user; return; }
+    }
+    lu_entry_t *e = xmalloc(sizeof(lu_entry_t));
+    e->comp_off = off; e->last_user = user;
+    e->next = t->b[h]; t->b[h] = e;
+}
+
+/* Returns SIZE_MAX when the offset is not in the table. */
+static size_t lu_get(const lu_table_t *t, lzma_vli off) {
+    size_t h = (size_t)(off >> 3) & LU_HASH_MASK;
+    for (const lu_entry_t *e = t->b[h]; e; e = e->next)
+        if (e->comp_off == off) return e->last_user;
+    return SIZE_MAX;
+}
+
+static void lu_free(lu_table_t *t) {
+    for (int h = 0; h < LU_HASH_SIZE; ++h) {
+        lu_entry_t *e = t->b[h];
+        while (e) { lu_entry_t *n = e->next; free(e); e = n; }
+        t->b[h] = NULL;
+    }
+}
+
+
+/* ---- LRU block cache --------------------------------------------------
+ *
+ * Caches decompressed lzma blocks so that a block shared by several files
+ * (in sorted order) is decompressed only once.  When the last consumer of
+ * a block has been served, bc_evict_done() drops it immediately; otherwise
+ * the classic LRU policy evicts the least-recently-used entry when the
+ * cache is full.
+ */
+
+#define BC_HASH_BITS    6
+#define BC_HASH_SIZE    (1 << BC_HASH_BITS)
+#define BC_HASH_MASK    (BC_HASH_SIZE - 1)
+#define BC_MAX_ENTRIES  32          /* maximum number of cached blocks */
+
+typedef struct bc_entry_t bc_entry_t;
+struct bc_entry_t {
+    lzma_vli   comp_off;    /* compressed-stream offset (key) */
+    off_t      ustart;      /* uncompressed start of this block's data */
+    uint8_t   *data;        /* decompressed bytes (owned by this entry) */
+    size_t     size;        /* number of decompressed bytes */
+    size_t     last_user;   /* sorted-order index of last file using block */
+    bc_entry_t *hash_next;  /* hash-chain */
+    bc_entry_t *lru_prev;   /* LRU doubly-linked list (head = MRU) */
+    bc_entry_t *lru_next;
+};
+
+typedef struct {
+    bc_entry_t *buckets[BC_HASH_SIZE];
+    bc_entry_t *lru_head, *lru_tail;
+    size_t      count;
+} bc_t;
+
+static void bc_init(bc_t *c) { memset(c, 0, sizeof(*c)); }
+
+static bc_entry_t *bc_lookup(bc_t *c, lzma_vli off) {
+    for (bc_entry_t *e = c->buckets[off & BC_HASH_MASK]; e; e = e->hash_next)
+        if (e->comp_off == off) return e;
+    return NULL;
+}
+
+static void bc_lru_unlink(bc_t *c, bc_entry_t *e) {
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else             c->lru_head = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else             c->lru_tail = e->lru_prev;
+}
+
+static void bc_lru_push_front(bc_t *c, bc_entry_t *e) {
+    e->lru_prev = NULL; e->lru_next = c->lru_head;
+    if (c->lru_head) c->lru_head->lru_prev = e;
+    else             c->lru_tail = e;
+    c->lru_head = e;
+}
+
+static void bc_touch(bc_t *c, bc_entry_t *e) {
+    bc_lru_unlink(c, e); bc_lru_push_front(c, e);
+}
+
+/* Remove one entry from the cache (hash + LRU) and free its storage. */
+static void bc_remove(bc_t *c, bc_entry_t *e) {
+    bc_entry_t **pp = &c->buckets[e->comp_off & BC_HASH_MASK];
+    while (*pp && *pp != e) pp = &(*pp)->hash_next;
+    if (*pp) *pp = e->hash_next;
+    bc_lru_unlink(c, e);
+    free(e->data);
+    free(e);
+    --c->count;
+}
+
+static void bc_evict_lru(bc_t *c) {
+    if (c->lru_tail) bc_remove(c, c->lru_tail);
+}
+
+/* Insert a decompressed block, taking ownership of data. */
+static bc_entry_t *bc_insert(bc_t *c, lzma_vli off, off_t ustart,
+                              uint8_t *data, size_t size, size_t last_user) {
+    if (c->count >= BC_MAX_ENTRIES) bc_evict_lru(c);
+    bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
+    e->comp_off = off; e->ustart = ustart;
+    e->data = data; e->size = size; e->last_user = last_user;
+    e->hash_next = c->buckets[off & BC_HASH_MASK];
+    c->buckets[off & BC_HASH_MASK] = e;
+    e->lru_prev = e->lru_next = NULL;
+    bc_lru_push_front(c, e);
+    ++c->count;
+    return e;
+}
+
+/* Proactively drop all entries whose last consumer was file_idx. */
+static void bc_evict_done(bc_t *c, size_t file_idx) {
+    for (int h = 0; h < BC_HASH_SIZE; ++h) {
+        bc_entry_t *e = c->buckets[h];
+        while (e) {
+            bc_entry_t *nx = e->hash_next;   /* save before possible free */
+            if (e->last_user == file_idx) bc_remove(c, e);
+            e = nx;
+        }
+    }
+}
+
+static void bc_free(bc_t *c) {
+    for (int h = 0; h < BC_HASH_SIZE; ++h) {
+        bc_entry_t *e = c->buckets[h];
+        while (e) { bc_entry_t *nx = e->hash_next; free(e->data); free(e); e = nx; }
+        c->buckets[h] = NULL;
+    }
+    c->lru_head = c->lru_tail = NULL;
+    c->count = 0;
+}
+
+
+/* ---- block decompression helper --------------------------------------- */
+
+/* Decompress one lzma data block (located at comp_off in the input file)
+ * into a freshly-allocated buffer.  The caller owns the returned buffer. */
+static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
+                                    size_t outsize) {
+    if (fseeko(gInFile, (off_t)comp_off, SEEK_SET) == -1)
+        die("Error seeking to block");
+
+    int hb = fgetc(gInFile);
+    if (hb == EOF || hb == 0)
+        die("Error reading block header byte");
+
+    lzma_filter filters[LZMA_FILTERS_MAX + 1];
+    lzma_block block = { .filters = filters, .check = check, .version = 0 };
+    block.header_size = lzma_block_header_size_decode(hb);
+
+    uint8_t hdrbuf[LZMA_BLOCK_HEADER_SIZE_MAX];
+    hdrbuf[0] = (uint8_t)hb;
+    if (fread(hdrbuf + 1, block.header_size - 1, 1, gInFile) != 1)
+        die("Error reading block header");
+    if (lzma_block_header_decode(&block, NULL, hdrbuf) != LZMA_OK)
+        die("Error decoding block header");
+
+    uint8_t *output = xmalloc(outsize);
+    lzma_stream stream = LZMA_STREAM_INIT;
+    if (lzma_block_decoder(&stream, &block) != LZMA_OK)
+        die("Error creating block decoder");
+    stream.next_out  = output;
+    stream.avail_out = outsize;
+
+    uint8_t ibuf[CHUNKSIZE];
+    lzma_ret err = LZMA_OK;
+    while (err != LZMA_STREAM_END) {
+        if (err != LZMA_OK)
+            die("Error decoding block data");
+        if (stream.avail_in == 0) {
+            stream.avail_in = fread(ibuf, 1, sizeof(ibuf), gInFile);
+            if (ferror(gInFile))
+                die("Error reading block data");
+            stream.next_in = ibuf;
+        }
+        err = lzma_code(&stream, LZMA_RUN);
+    }
+    lzma_end(&stream);
+    return output;
+}
+
+
+/* ---- per-file buffer fill --------------------------------------------- */
+
+/* Copy the bytes of one file [fstart, fend) from lzma blocks into buf.
+ * Blocks are fetched from (or added to) the LRU cache so that blocks shared
+ * by consecutive sorted files are decompressed only once. */
+static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
+                          lzma_vli fio, bc_t *cache, const lu_table_t *lu) {
+    lzma_index_iter iter;
+    lzma_index_iter_init(&iter, gIndex);
+    if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
+        die("Can't locate block for uncompressed offset %jd",
+            (intmax_t)fstart);
+
+    do {
+        if (iter.block.compressed_file_offset == fio)
+            continue;   /* skip the pixz file-index block */
+
+        off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
+        if (blk_ustart >= fend)
+            break;      /* no more blocks overlap this file */
+        off_t blk_uend = blk_ustart + (off_t)iter.block.uncompressed_size;
+
+        /* Get the block from the cache, or decompress and cache it. */
+        bc_entry_t *ce = bc_lookup(cache, iter.block.compressed_file_offset);
+        if (ce) {
+            bc_touch(cache, ce);
+        } else {
+            if (!iter.stream.flags)
+                die("Missing stream flags for block");
+            uint8_t *bdata = decompress_block_at(
+                iter.block.compressed_file_offset,
+                iter.stream.flags->check,
+                (size_t)iter.block.uncompressed_size);
+            size_t lu_val = lu_get(lu, iter.block.compressed_file_offset);
+            ce = bc_insert(cache,
+                           iter.block.compressed_file_offset, blk_ustart,
+                           bdata, (size_t)iter.block.uncompressed_size,
+                           lu_val);
+        }
+
+        /* Copy the overlapping byte range into the file buffer. */
+        off_t cstart = fstart > blk_ustart ? fstart : blk_ustart;
+        off_t cend   = fend   < blk_uend   ? fend   : blk_uend;
+        memcpy(buf    + (size_t)(cstart - fstart),
+               ce->data + (size_t)(cstart - blk_ustart),
+               (size_t)(cend - cstart));
+    } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
+}
+
+
+/* ---- main entry point ------------------------------------------------- */
+
+/* Load the pixz index once, sort it by file type (extension) then by
+ * filename, and write the tar entries (headers + data) to gOutFile in that
+ * new order.
+ *
+ * An LRU decompression cache prevents repeated decompression of lzma blocks
+ * that are shared by multiple files.  A last-user table (built in one pass
+ * over the sorted file list) lets the cache drop each entry as soon as its
+ * last consumer has been served, keeping memory usage low. */
 void pixz_sorted_extract(void) {
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
 
-    lzma_vli file_index_offset = read_file_index();
-    if (!file_index_offset)
+    lzma_vli fio = read_file_index();
+    if (!fio)
         die("No file index found - not a tar archive");
 
     /* Count non-sentinel entries (sentinel has name == NULL). */
@@ -742,136 +1011,90 @@ void pixz_sorted_extract(void) {
         return;
     }
 
-    /* Build an array of pointers into the file index, then sort it. */
+    /* Build a sorted array of file-index pointers. */
     file_index_t **sorted = xmalloc(count * sizeof(file_index_t *));
     size_t i = 0;
     for (file_index_t *f = gFileIndex; f && f->name; f = f->next)
         sorted[i++] = f;
     qsort(sorted, count, sizeof(file_index_t *), cmp_sorted_files);
 
-    /* Parallel arrays: uncompressed start offsets, byte sizes, output buffers. */
-    off_t    *starts = xmalloc(count * sizeof(off_t));
-    size_t   *sizes  = xmalloc(count * sizeof(size_t));
-    uint8_t **bufs   = xmalloc(count * sizeof(uint8_t *));
-
+    off_t  *starts = xmalloc(count * sizeof(off_t));
+    size_t *sizes  = xmalloc(count * sizeof(size_t));
     for (i = 0; i < count; ++i) {
         starts[i] = sorted[i]->offset;
         sizes[i]  = (size_t)(sorted[i]->next->offset - sorted[i]->offset);
-        bufs[i]   = xmalloc(sizes[i]);
     }
 
-    /* Walk every lzma block in the archive.  For each block that overlaps at
-     * least one wanted file, decompress it and copy the relevant byte ranges
-     * into the per-file buffers. */
-    lzma_index_iter iter;
-    lzma_index_iter_init(&iter, gIndex);
-    while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK)) {
-        /* Skip the pixz file-index block itself. */
-        if (iter.block.compressed_file_offset == file_index_offset)
-            continue;
+    /* Find the entry that is last in archive order; its size includes the
+     * original tar end-of-archive zeros and must be trimmed on output. */
+    size_t last_archive_idx = count;   /* count == "not found" sentinel */
+    for (size_t j = 0; j < count; ++j) {
+        if (sorted[j]->next->name == NULL) { last_archive_idx = j; break; }
+    }
 
-        off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
-        off_t blk_uend   = blk_ustart + (off_t)iter.block.uncompressed_size;
-
-        /* Does this block overlap any wanted file? */
-        bool needed = false;
-        for (size_t j = 0; j < count; ++j) {
-            if (starts[j] < blk_uend &&
-                    starts[j] + (off_t)sizes[j] > blk_ustart) {
-                needed = true;
-                break;
-            }
-        }
-        if (!needed) continue;
-
-        /* Seek to the compressed block and read its header. */
-        if (fseeko(gInFile, (off_t)iter.block.compressed_file_offset,
-                   SEEK_SET) == -1)
-            die("Error seeking to block");
-
-        int hb = fgetc(gInFile);
-        if (hb == EOF || hb == 0)
-            die("Error reading block header byte");
-
-        if (!iter.stream.flags)
-            die("Missing stream flags for block");
-
-        lzma_filter filters[LZMA_FILTERS_MAX + 1];
-        lzma_block block = { .filters = filters,
-                             .check   = iter.stream.flags->check,
-                             .version = 0 };
-        block.header_size = lzma_block_header_size_decode(hb);
-
-        uint8_t hdrbuf[LZMA_BLOCK_HEADER_SIZE_MAX];
-        hdrbuf[0] = (uint8_t)hb;
-        if (fread(hdrbuf + 1, block.header_size - 1, 1, gInFile) != 1)
-            die("Error reading block header");
-        if (lzma_block_header_decode(&block, NULL, hdrbuf) != LZMA_OK)
-            die("Error decoding block header");
-
-        /* Decompress the entire block into a temporary buffer. */
-        size_t outsize = (size_t)iter.block.uncompressed_size;
-        uint8_t *output = xmalloc(outsize);
-
-        lzma_stream stream = LZMA_STREAM_INIT;
-        if (lzma_block_decoder(&stream, &block) != LZMA_OK)
-            die("Error creating block decoder");
-        stream.next_out  = output;
-        stream.avail_out = outsize;
-
-        uint8_t ibuf[CHUNKSIZE];
-        lzma_ret err = LZMA_OK;
-        while (err != LZMA_STREAM_END) {
-            if (err != LZMA_OK)
-                die("Error decoding block data");
-            if (stream.avail_in == 0) {
-                stream.avail_in = fread(ibuf, 1, sizeof(ibuf), gInFile);
-                if (ferror(gInFile))
-                    die("Error reading block data");
-                stream.next_in = ibuf;
-            }
-            err = lzma_code(&stream, LZMA_RUN);
-        }
-        lzma_end(&stream);
-
-        /* Copy the relevant byte ranges from this block into file buffers. */
-        for (size_t j = 0; j < count; ++j) {
-            off_t fend = starts[j] + (off_t)sizes[j];
-            if (starts[j] >= blk_uend || fend <= blk_ustart)
+    /* Precompute last_user for every lzma block.
+     *
+     * Iterate sorted files in order (i = 0 … count-1).  For each file,
+     * locate its overlapping blocks and call lu_set(..., i).  Because i
+     * increases monotonically, each lu_set call overwrites with a larger
+     * value, so at the end lu_get(block) == max sorted index that needs it. */
+    lu_table_t lu;
+    lu_init(&lu);
+    for (i = 0; i < count; ++i) {
+        off_t fend = starts[i] + (off_t)sizes[i];
+        lzma_index_iter iter;
+        lzma_index_iter_init(&iter, gIndex);
+        if (lzma_index_iter_locate(&iter, (lzma_vli)starts[i]))
+            continue;   /* offset out of range; skip (shouldn't happen) */
+        do {
+            if (iter.block.compressed_file_offset == fio)
                 continue;
-            off_t cstart = starts[j] > blk_ustart ? starts[j] : blk_ustart;
-            off_t cend   = fend < blk_uend         ? fend       : blk_uend;
-            size_t csz   = (size_t)(cend - cstart);
-            memcpy(bufs[j]  + (size_t)(cstart - starts[j]),
-                   output   + (size_t)(cstart - blk_ustart),
-                   csz);
-        }
-
-        free(output);
+            if ((off_t)iter.block.uncompressed_file_offset >= fend)
+                break;
+            lu_set(&lu, iter.block.compressed_file_offset, i);
+        } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
     }
 
-    /* The sentinel offset includes the original tar's end-of-archive zero
-     * blocks, so the entry that is last in archive order has a size larger
-     * than its actual tar entry.  Trim those trailing zero bytes so they
-     * don't appear mid-stream when that entry is not last in sorted order.
-     * Scan backwards for the last non-zero byte, then round up to the next
-     * 512-byte tar block boundary. */
+    /* Extract and write files in sorted order.
+     *
+     * For each file we fill a temporary buffer from the LRU block cache,
+     * write it to gOutFile, then evict any cache blocks whose last consumer
+     * was just this file. */
+    bc_t   cache;
+    bc_init(&cache);
+    uint8_t *fbuf     = NULL;
+    size_t   fbuf_cap = 0;
+
     for (i = 0; i < count; ++i) {
-        if (sorted[i]->next->name == NULL) {
-            ssize_t last_nz = (ssize_t)sizes[i] - 1;
-            while (last_nz >= 0 && bufs[i][last_nz] == 0)
+        /* Grow the per-file working buffer on demand. */
+        if (sizes[i] > fbuf_cap) {
+            free(fbuf);
+            fbuf     = xmalloc(sizes[i]);
+            fbuf_cap = sizes[i];
+        }
+
+        fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
+                      fio, &cache, &lu);
+
+        /* The entry that is last in archive order carries trailing tar
+         * end-of-archive zeros in its size.  Trim those zeros so they
+         * do not appear in the middle of the sorted output stream.
+         * Scan backwards for the last non-zero byte, then round up to
+         * the next 512-byte tar block boundary. */
+        size_t write_size = sizes[i];
+        if (i == last_archive_idx) {
+            ssize_t last_nz = (ssize_t)write_size - 1;
+            while (last_nz >= 0 && fbuf[last_nz] == 0)
                 --last_nz;
-            sizes[i] = last_nz < 0 ? 0
+            write_size = last_nz < 0 ? 0
                 : (size_t)(last_nz + 1 + 511) / 512 * 512;
-            break;
         }
-    }
 
-    /* Write all files to gOutFile in sorted order. */
-    for (i = 0; i < count; ++i) {
-        if (fwrite(bufs[i], sizes[i], 1, gOutFile) != 1)
+        if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
             die("Error writing sorted output");
-        free(bufs[i]);
+
+        /* Drop cache entries that no future file will need. */
+        bc_evict_done(&cache, i);
     }
 
     /* Write the tar end-of-archive marker: two 512-byte zero blocks. */
@@ -880,10 +1103,12 @@ void pixz_sorted_extract(void) {
     if (fwrite(tar_eof, sizeof(tar_eof), 1, gOutFile) != 1)
         die("Error writing tar EOF");
 
+    bc_free(&cache);
+    lu_free(&lu);
+    free(fbuf);
     free(sorted);
     free(starts);
     free(sizes);
-    free(bufs);
     free_file_index();
     lzma_index_end(gIndex, NULL);
 }
