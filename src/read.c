@@ -744,11 +744,19 @@ static int cmp_sorted_files(const void *a, const void *b) {
 }
 
 
-/* ---- last-user lookup table -------------------------------------------
+/* ---- access-list lookup table -----------------------------------------
  *
- * Maps lzma block compressed-offset → the highest sorted-order file index
- * that overlaps that block.  Used to decide when a cached block can be
- * proactively evicted.
+ * For each lzma block (keyed by compressed offset) we record every
+ * sorted-order file index that overlaps it.  Because the prepass iterates
+ * i = 0 … count-1 in ascending order, appending gives a naturally sorted
+ * array — no post-sort needed.
+ *
+ * Two queries are used:
+ *   lu_last_user  – the highest index (= users[user_count-1]); used by
+ *                   bc_evict_done() to know when a cached block is dead.
+ *   lu_next_user  – the smallest index strictly greater than after_idx;
+ *                   used by bc_evict_belady() to implement the true Bélády
+ *                   policy (evict the block whose *next* use is furthest).
  */
 
 #define LU_HASH_BITS 8
@@ -763,7 +771,9 @@ static int cmp_sorted_files(const void *a, const void *b) {
 typedef struct lu_entry_t lu_entry_t;
 struct lu_entry_t {
     lzma_vli   comp_off;
-    size_t     last_user;   /* sorted-order index of last file using block */
+    size_t    *users;       /* sorted array of sorted-order indices */
+    size_t     user_count;
+    size_t     user_cap;
     lu_entry_t *next;       /* hash-chain */
 };
 
@@ -771,29 +781,69 @@ typedef struct { lu_entry_t *b[LU_HASH_SIZE]; } lu_table_t;
 
 static void lu_init(lu_table_t *t) { memset(t, 0, sizeof(*t)); }
 
-/* Always overwrites; caller guarantees user values are non-decreasing. */
-static void lu_set(lu_table_t *t, lzma_vli off, size_t user) {
+/* Append user to the block's access list.  Caller must call with
+ * non-decreasing user values so the list stays sorted.  Consecutive
+ * duplicate values are silently dropped (a file can only use a block once). */
+static void lu_add_access(lu_table_t *t, lzma_vli off, size_t user) {
     size_t h = LU_HASH(off);
-    for (lu_entry_t *e = t->b[h]; e; e = e->next) {
-        if (e->comp_off == off) { e->last_user = user; return; }
+    lu_entry_t *e;
+    for (e = t->b[h]; e; e = e->next)
+        if (e->comp_off == off) break;
+    if (!e) {
+        e = xmalloc(sizeof(lu_entry_t));
+        e->comp_off = off;
+        e->users = NULL;
+        e->user_count = e->user_cap = 0;
+        e->next = t->b[h]; t->b[h] = e;
     }
-    lu_entry_t *e = xmalloc(sizeof(lu_entry_t));
-    e->comp_off = off; e->last_user = user;
-    e->next = t->b[h]; t->b[h] = e;
+    /* Drop consecutive duplicate. */
+    if (e->user_count > 0 && e->users[e->user_count - 1] == user)
+        return;
+    if (e->user_count == e->user_cap) {
+        e->user_cap = e->user_cap ? e->user_cap * 2 : 4;
+        size_t *tmp = realloc(e->users, e->user_cap * sizeof(size_t));
+        if (!tmp) die("Out of memory in lu_add_access");
+        e->users = tmp;
+    }
+    e->users[e->user_count++] = user;
 }
 
-/* Returns SIZE_MAX when the offset is not in the table. */
-static size_t lu_get(const lu_table_t *t, lzma_vli off) {
+/* Returns the last (highest) accessing index, or SIZE_MAX if not found. */
+static size_t lu_last_user(const lu_table_t *t, lzma_vli off) {
     size_t h = LU_HASH(off);
     for (const lu_entry_t *e = t->b[h]; e; e = e->next)
-        if (e->comp_off == off) return e->last_user;
+        if (e->comp_off == off)
+            return e->user_count ? e->users[e->user_count - 1] : SIZE_MAX;
+    return SIZE_MAX;
+}
+
+/* Returns the smallest accessing index strictly greater than after_idx,
+ * or SIZE_MAX if there is none (block is no longer needed). */
+static size_t lu_next_user(const lu_table_t *t, lzma_vli off, size_t after_idx) {
+    size_t h = LU_HASH(off);
+    for (const lu_entry_t *e = t->b[h]; e; e = e->next) {
+        if (e->comp_off != off) continue;
+        /* Binary search for first element > after_idx. */
+        size_t lo = 0, hi = e->user_count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (e->users[mid] <= after_idx) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < e->user_count ? e->users[lo] : SIZE_MAX;
+    }
     return SIZE_MAX;
 }
 
 static void lu_free(lu_table_t *t) {
     for (int h = 0; h < LU_HASH_SIZE; ++h) {
         lu_entry_t *e = t->b[h];
-        while (e) { lu_entry_t *n = e->next; free(e); e = n; }
+        while (e) {
+            lu_entry_t *n = e->next;
+            free(e->users);
+            free(e);
+            e = n;
+        }
         t->b[h] = NULL;
     }
 }
@@ -804,12 +854,12 @@ static void lu_free(lu_table_t *t) {
  * Caches decompressed lzma blocks so that a block shared by several files
  * (in sorted order) is decompressed only once.  When the last consumer of
  * a block has been served, bc_evict_done() drops it immediately.  When the
- * cache is full and a new block must be inserted, bc_evict_belady() evicts
- * the entry whose last consumer is furthest ahead in sorted order — the
- * optimal (Bélády) policy.  Because bc_evict_done() guarantees that every
- * cached entry's last_user is strictly greater than the current file index,
- * the largest last_user value identifies the entry that can be deferred the
- * longest, making it the correct eviction target.
+ * cache is full and a new block must be inserted, bc_evict_belady() applies
+ * the true Bélády policy: it consults the per-block access lists to find
+ * each cached entry's *next* consumer after the current file index, then
+ * evicts the entry whose next consumer is furthest ahead (or has no next
+ * consumer).  This is provably optimal — no other eviction policy makes
+ * fewer cache misses for the same cache size.
  */
 
 #define BC_HASH_BITS    6
@@ -851,16 +901,19 @@ static void bc_remove(bc_t *c, bc_entry_t *e) {
     --c->count;
 }
 
-/* Evict the entry whose last consumer is furthest ahead (Bélády's policy).
- * bc_evict_done() guarantees that all cached entries have last_user strictly
- * greater than the current file index, so the entry with the largest
- * last_user is the correct eviction target. */
-static void bc_evict_belady(bc_t *c) {
+/* Evict the entry whose *next* consumer is furthest ahead (true Bélády).
+ * Scans all BC_MAX_ENTRIES cached blocks, queries lu_next_user for each,
+ * and removes the one with the largest result.  O(BC_MAX_ENTRIES) per call. */
+static void bc_evict_belady(bc_t *c, const lu_table_t *lu, size_t current_idx) {
     bc_entry_t *victim = NULL;
+    size_t victim_next = 0;
     for (int h = 0; h < BC_HASH_SIZE; ++h) {
         for (bc_entry_t *e = c->buckets[h]; e; e = e->hash_next) {
-            if (!victim || e->last_user > victim->last_user)
+            size_t nxt = lu_next_user(lu, e->comp_off, current_idx);
+            if (!victim || nxt > victim_next) {
                 victim = e;
+                victim_next = nxt;
+            }
         }
     }
     if (victim) bc_remove(c, victim);
@@ -868,8 +921,9 @@ static void bc_evict_belady(bc_t *c) {
 
 /* Insert a decompressed block, taking ownership of data. */
 static bc_entry_t *bc_insert(bc_t *c, lzma_vli off, off_t ustart,
-                              uint8_t *data, size_t size, size_t last_user) {
-    if (c->count >= BC_MAX_ENTRIES) bc_evict_belady(c);
+                              uint8_t *data, size_t size, size_t last_user,
+                              const lu_table_t *lu, size_t current_idx) {
+    if (c->count >= BC_MAX_ENTRIES) bc_evict_belady(c, lu, current_idx);
     bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
     e->comp_off = off; e->ustart = ustart;
     e->data = data; e->size = size; e->last_user = last_user;
@@ -953,10 +1007,11 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
 /* ---- per-file buffer fill --------------------------------------------- */
 
 /* Copy the bytes of one file [fstart, fend) from lzma blocks into buf.
- * Blocks are fetched from (or added to) the LRU cache so that blocks shared
- * by consecutive sorted files are decompressed only once. */
+ * Blocks are fetched from (or added to) the Bélády cache so that blocks
+ * shared by consecutive sorted files are decompressed only once. */
 static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
-                          lzma_vli fio, bc_t *cache, const lu_table_t *lu) {
+                          lzma_vli fio, bc_t *cache, const lu_table_t *lu,
+                          size_t current_idx) {
     lzma_index_iter iter;
     lzma_index_iter_init(&iter, gIndex);
     if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
@@ -981,11 +1036,11 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
                 iter.block.compressed_file_offset,
                 iter.stream.flags->check,
                 (size_t)iter.block.uncompressed_size);
-            size_t lu_val = lu_get(lu, iter.block.compressed_file_offset);
+            size_t lu_val = lu_last_user(lu, iter.block.compressed_file_offset);
             ce = bc_insert(cache,
                            iter.block.compressed_file_offset, blk_ustart,
                            bdata, (size_t)iter.block.uncompressed_size,
-                           lu_val);
+                           lu_val, lu, current_idx);
         }
 
         /* Copy the overlapping byte range into the file buffer. */
@@ -1009,11 +1064,11 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
  * dictionary.  Within each directory, files are further grouped by extension.
  *
  * A Bélády-optimal decompression cache prevents repeated decompression of
- * lzma blocks that are shared by multiple files.  A last-user table (built
- * in one prepass over the sorted file list) drives both the proactive
- * eviction (bc_evict_done, called after each file) and the Bélády fallback
- * (bc_evict_belady): when the cache is full, the entry whose last consumer
- * is furthest ahead is evicted — the theoretically optimal choice. */
+ * lzma blocks that are shared by multiple files.  A per-block access list
+ * (built in one prepass over the sorted file list) drives both the proactive
+ * eviction (bc_evict_done, called after each file) and the true Bélády
+ * fallback (bc_evict_belady): when the cache is full, the entry whose *next*
+ * consumer is furthest ahead is evicted — the theoretically optimal choice. */
 void pixz_sorted_extract(void) {
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
@@ -1058,12 +1113,11 @@ void pixz_sorted_extract(void) {
         }
     }
 
-    /* Precompute last_user for every lzma block.
+    /* Build the per-block access lists.
      *
      * Iterate sorted files in order (i = 0 … count-1).  For each file,
-     * locate its overlapping blocks and call lu_set(..., i).  Because i
-     * increases monotonically, each lu_set call overwrites with a larger
-     * value, so at the end lu_get(block) == max sorted index that needs it. */
+     * locate its overlapping blocks and record i as an accessing index.
+     * Because i is non-decreasing, lu_add_access appends in sorted order. */
     lu_table_t lu;
     lu_init(&lu);
     for (i = 0; i < count; ++i) {
@@ -1077,13 +1131,13 @@ void pixz_sorted_extract(void) {
                 continue;
             if ((off_t)iter.block.uncompressed_file_offset >= fend)
                 break;
-            lu_set(&lu, iter.block.compressed_file_offset, i);
+            lu_add_access(&lu, iter.block.compressed_file_offset, i);
         } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
     }
 
     /* Extract and write files in sorted order.
      *
-     * For each file we fill a temporary buffer from the LRU block cache,
+     * For each file we fill a temporary buffer from the Bélády block cache,
      * write it to gOutFile, then evict any cache blocks whose last consumer
      * was just this file. */
     bc_t   cache;
@@ -1100,7 +1154,7 @@ void pixz_sorted_extract(void) {
         }
 
         fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
-                      fio, &cache, &lu);
+                      fio, &cache, &lu, i);
 
         /* The entry that is last in archive order carries trailing tar
          * end-of-archive zeros in its size.  Trim those zeros so they
