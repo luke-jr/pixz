@@ -1263,15 +1263,47 @@ void pixz_sorted_extract(void) {
          * end-of-archive zeros in its size (two-block EOF marker plus any
          * blocking-factor padding added by tar).  Trim those zeros so they
          * do not appear in the middle of the sorted output stream, and record
-         * how many were trimmed so we can restore them at the end. */
+         * how many were trimmed so we can restore them at the end.
+         *
+         * We locate the boundary by walking FORWARD through the buffer,
+         * parsing each tar header to skip exactly over its data blocks,
+         * until we reach a 512-byte all-zero block (the first EOF marker).
+         * Scanning backwards for zeros is wrong: it corrupts files whose
+         * content ends with zero bytes, replacing actual data with extra
+         * zeros at the tail of the archive. */
         size_t write_size = sizes[i];
         if (i == last_in_archive_sorted_idx) {
-            ssize_t last_nz = (ssize_t)write_size - 1;
-            while (last_nz >= 0 && fbuf[last_nz] == 0)
-                --last_nz;
-            write_size = last_nz < 0 ? 0
-                : ROUND_UP_TO_TAR_BLOCK((size_t)last_nz + 1);
-            /* Preserve original trailing-zero count (>= 1024 for valid tar).*/
+            size_t pos = 0;
+            while (pos + TAR_BLOCK_SIZE <= write_size) {
+                /* Check whether the block at `pos` is the all-zero EOF
+                 * marker.  Use a manual loop so we can break early. */
+                size_t k;
+                for (k = 0; k < TAR_BLOCK_SIZE; k++)
+                    if (fbuf[pos + k] != 0) break;
+                if (k == TAR_BLOCK_SIZE)
+                    break; /* found the EOF region */
+
+                /* Read the entry data size from the octal field at offset
+                 * 124 within the 512-byte header block.  GNU tar encodes
+                 * sizes > 8 GiB in base-256 (first byte has bit 7 set). */
+                uint64_t entry_size = 0;
+                if (fbuf[pos + 124] & 0x80) {
+                    /* base-256: 11 value bytes follow the flag byte */
+                    for (k = 1; k < 12; k++)
+                        entry_size = (entry_size << 8) | fbuf[pos + 124 + k];
+                } else {
+                    for (k = 0; k < 12; k++) {
+                        uint8_t c = fbuf[pos + 124 + k];
+                        if (c < '0' || c > '7') break;
+                        entry_size = entry_size * 8 + (c - '0');
+                    }
+                }
+
+                /* Advance past this header block and its padded data. */
+                pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
+            }
+
+            write_size = (pos <= sizes[i]) ? pos : sizes[i];
             tail_zeros = sizes[i] - write_size;
             if (tail_zeros < TAR_BLOCK_SIZE * 2)
                 tail_zeros = TAR_BLOCK_SIZE * 2;

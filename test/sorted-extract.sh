@@ -2,6 +2,10 @@
 # Test that -S extracts files sorted by file type (extension) then filename,
 # and that header-only entries (directories, 0-byte files) sort before all
 # regular files.
+#
+# Also verifies that a file whose content ends with zero bytes is not
+# corrupted: the forward-parsing EOF-boundary detection must not confuse
+# zero-valued file data with the tar end-of-archive marker.
 
 PIXZ=../src/pixz
 
@@ -27,14 +31,21 @@ printf 'build\n'   > "$MAKEFILE"
 mkdir -p "$TMPDIR/subdir"
 printf 'sub\n' > "$TMPDIR/subdir/sub.c"
 
+# zeros.bin: a file whose content is entirely zero bytes.  Its last archive
+# block therefore looks identical to a tar EOF block; the extractor must use
+# the header size field rather than scanning backwards to find the boundary.
+ZEROS_BIN=$TMPDIR/zeros.bin
+dd if=/dev/zero of="$ZEROS_BIN" bs=512 count=4 2>/dev/null
+
 TAR_FILE=$TMPDIR/test.tar
 PIXZ_FILE=$TMPDIR/test.tpxz
 SORTED_TAR=$TMPDIR/sorted.tar
 
 # Build tar in an order that differs from the sorted result.
 # Archive order: readme.txt, main.h, Makefile, alpha.c, notes.txt, beta.c,
-#                subdir/ (directory entry), subdir/sub.c
-tar cf "$TAR_FILE" -C "$TMPDIR" readme.txt main.h Makefile alpha.c notes.txt beta.c subdir
+#                subdir/ (directory entry), subdir/sub.c, zeros.bin
+# zeros.bin is placed LAST so it is the final entry before the EOF marker.
+tar cf "$TAR_FILE" -C "$TMPDIR" readme.txt main.h Makefile alpha.c notes.txt beta.c subdir zeros.bin
 
 $PIXZ "$TAR_FILE" "$PIXZ_FILE"
 
@@ -47,11 +58,13 @@ ACTUAL=$(tar tf "$SORTED_TAR" 2>&1)
 #   Tier 0 (header-only): subdir/           <- directory entry, no data
 #   Tier 1 small files by extension then name:
 #     no extension: Makefile
+#     .bin:         zeros.bin
 #     .c:           alpha.c, beta.c, subdir/sub.c
 #     .h:           main.h
 #     .txt:         notes.txt, readme.txt
 EXPECTED="subdir/
 Makefile
+zeros.bin
 alpha.c
 beta.c
 subdir/sub.c
@@ -73,10 +86,10 @@ EXTRACT_DIR=$TMPDIR/extracted
 mkdir -p "$EXTRACT_DIR"
 tar xf "$SORTED_TAR" -C "$EXTRACT_DIR"
 
-for name in alpha.c beta.c main.h notes.txt readme.txt Makefile subdir/sub.c; do
-    ORIG=$(cat "$TMPDIR/$name")
-    EXTR=$(cat "$EXTRACT_DIR/$name")
-    if [ "$ORIG" != "$EXTR" ]; then
+for name in alpha.c beta.c main.h notes.txt readme.txt Makefile subdir/sub.c zeros.bin; do
+    ORIG_MD5=$(md5sum "$TMPDIR/$name" | awk '{print $1}')
+    EXTR_MD5=$(md5sum "$EXTRACT_DIR/$name" | awk '{print $1}')
+    if [ "$ORIG_MD5" != "$EXTR_MD5" ]; then
         echo "FAIL: content mismatch for $name"
         exit 1
     fi
