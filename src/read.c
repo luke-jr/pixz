@@ -916,6 +916,7 @@ static void lu_add_access(lu_table_t *t, lzma_vli off, size_t user) {
         e->comp_off = off;
         e->users = NULL;
         e->user_count = e->user_cap = 0;
+        e->seen = false;
         e->next = t->b[h]; t->b[h] = e;
     }
     /* Drop consecutive duplicate. */
