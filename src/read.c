@@ -1466,11 +1466,21 @@ void pixz_sorted_extract(void) {
         bc_evict_done(&cache, i);
 
         if (sSortStatsPrint) {
-            sSortStatsPrint = 0;
-            fprintf(stderr, "sorted-extract stats [%zu/%zu]: decompressions=%zu"
-                    "  cache_hits=%zu  redecompressions=%zu\n",
-                    i + 1, count,
-                    stats.decompressions, stats.cache_hits, stats.redecompressions);
+            /* Block SIGUSR1 while we clear the flag so that a signal
+             * arriving between the check above and the clear below is not
+             * silently lost (TOCTOU race). */
+            sigset_t blk, old;
+            sigemptyset(&blk);
+            sigaddset(&blk, SIGUSR1);
+            sigprocmask(SIG_BLOCK, &blk, &old);
+            int do_print = sSortStatsPrint;
+            if (do_print) sSortStatsPrint = 0;
+            sigprocmask(SIG_SETMASK, &old, NULL);
+            if (do_print)
+                fprintf(stderr, "sorted-extract stats [%zu/%zu]: decompressions=%zu"
+                        "  cache_hits=%zu  redecompressions=%zu\n",
+                        i + 1, count,
+                        stats.decompressions, stats.cache_hits, stats.redecompressions);
         }
     }
 
@@ -1497,6 +1507,7 @@ void pixz_sorted_extract(void) {
     free(sizes);
     free_file_index();
     lzma_index_end(gIndex, NULL);
-    sigaction(SIGUSR1, &old_sa, NULL);
+    if (sigusr1_installed)
+        sigaction(SIGUSR1, &old_sa, NULL);
 }
 
