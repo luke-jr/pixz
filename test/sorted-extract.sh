@@ -153,4 +153,72 @@ case "$TRUNC_ACTUAL" in
         ;;
 esac
 
+# ---------------------------------------------------------------------------
+# Test 3: backup/metadata suffix stripping.
+# Files whose names carry one of the known backup suffixes should sort as
+# though the suffix were not present, i.e. "foo.c.bak" groups with ".c".
+# ---------------------------------------------------------------------------
+
+SFX_DIR=$TMPDIR/sfx
+mkdir -p "$SFX_DIR"
+
+# A baseline .c file and copies with every supported backup suffix.
+# Each variant must sort alongside the baseline .c files.
+printf 'c\n'      > "$SFX_DIR/base.c"
+printf 'bak\n'    > "$SFX_DIR/base.c.bak"
+printf 'tilde\n'  > "$SFX_DIR/base.c~"
+printf 'old\n'    > "$SFX_DIR/base.c.old"
+printf 'orig\n'   > "$SFX_DIR/base.c.orig"
+printf 'rej\n'    > "$SFX_DIR/base.c.rej"
+printf 'new\n'    > "$SFX_DIR/base.c.new"
+printf 'svn\n'    > "$SFX_DIR/base.c.svn-base"
+printf 'dpkgold\n' > "$SFX_DIR/base.c.dpkg-old"
+printf 'dpkgnew\n' > "$SFX_DIR/base.c.dpkg-new"
+printf 'dpkgdist\n' > "$SFX_DIR/base.c.dpkg-dist"
+printf 'dpkgbak\n'  > "$SFX_DIR/base.c.dpkg-bak"
+printf 'rpmsave\n'  > "$SFX_DIR/base.c.rpmsave"
+printf 'rpmnew\n'   > "$SFX_DIR/base.c.rpmnew"
+printf 'rpmorig\n'  > "$SFX_DIR/base.c.rpmorig"
+printf 'pacnew\n'   > "$SFX_DIR/base.c.pacnew"
+printf 'pacsave\n'  > "$SFX_DIR/base.c.pacsave"
+# A .txt file so there is a second extension group to anchor sorting.
+printf 'txt\n'    > "$SFX_DIR/readme.txt"
+
+SFX_TAR=$TMPDIR/sfx.tar
+SFX_PIXZ=$TMPDIR/sfx.tpxz
+SFX_SORTED=$TMPDIR/sfx_sorted.tar
+
+# Build tar in reverse-alphabetical order (deliberately not sorted).
+tar cf "$SFX_TAR" -C "$SFX_DIR" \
+    readme.txt \
+    base.c.svn-base base.c.rpmsave base.c.rpmnew base.c.rpmorig \
+    base.c.pacsave base.c.pacnew \
+    base.c.orig base.c.rej base.c.old base.c.new \
+    base.c.dpkg-old base.c.dpkg-new base.c.dpkg-dist base.c.dpkg-bak \
+    "base.c~" base.c.bak base.c
+
+$PIXZ "$SFX_TAR" "$SFX_PIXZ"
+$PIXZ -S "$SFX_PIXZ" > "$SFX_SORTED"
+
+SFX_ACTUAL=$(tar tf "$SFX_SORTED")
+
+# All .c* variants must appear before readme.txt (i.e. in the .c bucket).
+# Capture line numbers for the last .c* entry and the .txt entry.
+C_LAST=$(echo "$SFX_ACTUAL"  | grep -n '\.c'    | tail -1 | cut -d: -f1)
+TXT_LINE=$(echo "$SFX_ACTUAL" | grep -n '\.txt$' | head -1 | cut -d: -f1)
+
+if [ -z "$C_LAST" ] || [ -z "$TXT_LINE" ]; then
+    echo "FAIL (suffix strip): could not find expected entries in sorted output"
+    echo "Got:"
+    echo "$SFX_ACTUAL"
+    exit 1
+fi
+
+if [ "$C_LAST" -ge "$TXT_LINE" ]; then
+    echo "FAIL (suffix strip): .c* entries not all before .txt"
+    echo "Got:"
+    echo "$SFX_ACTUAL"
+    exit 1
+fi
+
 exit 0

@@ -716,8 +716,14 @@ static bool taste_file_index(io_block_t *ib) {
  *  - For compressed files the inner format is ignored — "archive.tar.gz" and
  *    "image.cpio.gz" both return ".gz", because the compression format
  *    dominates compressibility.
- *  - A trailing ".svn-base" suffix (Subversion pristine-copy marker) is
- *    stripped first, so "foo.c.svn-base" groups with ".c".
+ *  - Trailing backup/metadata suffixes are stripped first so that e.g.
+ *    "foo.c.bak" and "foo.c~" group with ".c" files.  Stripped suffixes:
+ *      .svn-base           Subversion pristine-copy marker
+ *      .bak  ~  .old       generic editor/tool backup suffixes
+ *      .orig  .rej  .new  patch-workflow originals, rejects, and replacements
+ *      .dpkg-old  .dpkg-new  .dpkg-dist  .dpkg-bak   dpkg config handling
+ *      .rpmsave  .rpmnew  .rpmorig        RPM config handling
+ *      .pacnew  .pacsave                  pacman config handling
  *  - A leading dot (hidden files like ".gitignore") is not an extension.
  *
  * Returns an empty string if there is no extension. */
@@ -729,20 +735,41 @@ static const char *file_type_ext(const char *name) {
     const char *slash = strrchr(name, '/');
     const char *base  = slash ? slash + 1 : name;
 
-    /* Strip a trailing ".svn-base" suffix.  We need the result to be
-     * null-terminated at the right place, so copy into a static buffer when
-     * stripping is needed; the comparator that calls us is single-threaded. */
-    static const char svn_sfx[] = ".svn-base";
+    /* Strip at most one trailing backup/metadata suffix so that e.g.
+     * "foo.c.bak" groups with ".c".  Copy into a static buffer when stripping
+     * is needed; the comparator that calls us is single-threaded. */
+    static const char * const strip_sfx[] = {
+        ".svn-base",   /* Subversion pristine-copy marker */
+        ".bak",        /* generic backup */
+        "~",           /* Emacs / editor tilde backup */
+        ".old",        /* generic old-version backup */
+        ".orig",       /* original file (patch workflow, Debian, etc.) */
+        ".rej",        /* patch reject file */
+        ".new",        /* new-version counterpart of .old/.orig */
+        ".dpkg-old",   /* dpkg: replaced config file */
+        ".dpkg-new",   /* dpkg: new config file not yet adopted */
+        ".dpkg-dist",  /* dpkg: distributor's default config */
+        ".dpkg-bak",   /* dpkg: backup of the previous config */
+        ".rpmsave",    /* RPM: saved config replaced by package */
+        ".rpmnew",     /* RPM: new config not yet adopted */
+        ".rpmorig",    /* RPM: original config saved before first install */
+        ".pacnew",     /* pacman: new config not yet adopted */
+        ".pacsave",    /* pacman: saved config replaced by package */
+        NULL
+    };
     static char buf[4096];
     size_t blen = strlen(base);
-    if (blen >= sizeof svn_sfx - 1 &&
-            memcmp(base + blen - (sizeof svn_sfx - 1),
-                   svn_sfx, sizeof svn_sfx - 1) == 0) {
-        size_t tlen = blen - (sizeof svn_sfx - 1);
-        if (tlen >= sizeof buf) tlen = sizeof buf - 1;
-        memcpy(buf, base, tlen);
-        buf[tlen] = '\0';
-        base = buf;
+    for (const char * const *sfx = strip_sfx; *sfx; sfx++) {
+        size_t slen = strlen(*sfx);
+        if (blen >= slen &&
+                memcmp(base + blen - slen, *sfx, slen) == 0) {
+            size_t tlen = blen - slen;
+            if (tlen >= sizeof buf) tlen = sizeof buf - 1;
+            memcpy(buf, base, tlen);
+            buf[tlen] = '\0';
+            base = buf;
+            break;  /* strip at most one suffix */
+        }
     }
 
     /* Scan backwards, tracking whether every character seen since the last dot
