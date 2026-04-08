@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
                 unsigned long val = strtoul(optarg, &end, 10);
                 if (end == optarg || val == 0)
                     usage("Need a positive integer argument to -D");
-                unsigned long mult = 1024UL * 1024; /* default: MiB */
+                unsigned long mult = 1024UL * 1024; /* bare number treated as MiB */
                 if (*end == 'K' || *end == 'k') { mult = 1024UL; ++end; }
                 else if (*end == 'M' || *end == 'm') { mult = 1024UL * 1024; ++end; }
                 else if (*end == 'G' || *end == 'g') { mult = 1024UL * 1024 * 1024; ++end; }
