@@ -708,19 +708,6 @@ static bool taste_file_index(io_block_t *ib) {
 #define ROUND_UP_TO_TAR_BLOCK(n) \
     (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
-/* Maximum uncompressed file range that is buffered in a flat allocation.
- * Files whose range exceeds this threshold are written directly to gOutFile
- * one lzma block at a time, keeping peak memory bounded regardless of the
- * size of individual archive members.  256 MiB is generous enough for
- * virtually all source trees and package archives while preventing the
- * multi-GB allocations that cause OOM for very large archive members. */
-#define FBUF_MAX ((size_t)(256 * 1024 * 1024))   /* 256 MiB */
-
-/* Bytes of the file range read into a temporary buffer solely to locate
- * the tar EOF boundary.  512 bytes (one tar header) is the minimum; using
- * 4 KiB accommodates PAX extended header blocks (~1.5 KiB) with margin. */
-#define HDR_SCAN_SIZE 4096
-
 /* Return the extension (including the leading dot) from the last path
  * component.  Uses the *last non-numeric* dot component so that:
  *  - Dots in version-number stems (e.g. "libstdc++6-4.4-dev_4.4.5-8_i386.deb")
@@ -1219,89 +1206,29 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
 }
 
 
-/* ---- per-file buffer fill and streaming output ------------------------ */
-
-/* Copy the bytes of one file [fstart, fend) from lzma blocks into buf.
- * Blocks with future consumers are fetched from (or added to) the Bélády
- * cache so they are decompressed only once.  Blocks with no future consumer
- * (single-use or last-use) are decompressed, copied, and freed immediately
- * to avoid polluting the cache with data no subsequent file needs.
- * *stats is updated with cache-hit and (re-)decompression counts. */
-static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
-                          lzma_vli fio, bc_t *cache, lu_table_t *lu,
-                          size_t current_idx, sort_stats_t *stats) {
-    lzma_index_iter iter;
-    lzma_index_iter_init(&iter, gIndex);
-    if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
-        die("Can't locate block for uncompressed offset %jd",
-            (intmax_t)fstart);
-
-    do {
-        if (iter.block.compressed_file_offset == fio)
-            continue;   /* skip the pixz file-index block */
-
-        off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
-        if (blk_ustart >= fend)
-            break;      /* no more blocks overlap this file */
-        off_t blk_uend = blk_ustart + (off_t)iter.block.uncompressed_size;
-
-        /* Obtain the decompressed block data (from cache or fresh). */
-        bc_entry_t *ce = bc_lookup(cache, iter.block.compressed_file_offset);
-        uint8_t *bdata_free = NULL;  /* non-NULL: caller must free after copy */
-        const uint8_t *bdata;
-        if (ce) {
-            stats->cache_hits++;
-            bdata = ce->data;
-        } else {
-            if (!iter.stream.flags)
-                die("Missing stream flags for block");
-            /* Count re-decompressions: shared blocks (in lu_table) that have
-             * already been decompressed once but were evicted from the cache.
-             * decompressions and redecompressions are mutually exclusive so
-             * that decompressions + cache_hits + redecompressions == total
-             * block accesses. */
-            if (lu_is_seen(lu, iter.block.compressed_file_offset))
-                stats->redecompressions++;
-            else
-                stats->decompressions++;
-            uint8_t *new_data = decompress_block_at(
-                iter.block.compressed_file_offset,
-                iter.stream.flags->check,
-                (size_t)iter.block.uncompressed_size);
-            /* If no future consumer exists after current_idx, bypass the
-             * cache to avoid evicting genuinely shared blocks. */
-            if (lu_next_user(lu, iter.block.compressed_file_offset,
-                             current_idx) != SIZE_MAX) {
-                lu_mark_seen(lu, iter.block.compressed_file_offset);
-                size_t lu_val = lu_last_user(lu,
-                                    iter.block.compressed_file_offset);
-                ce = bc_insert(cache,
-                               iter.block.compressed_file_offset,
-                               new_data, (size_t)iter.block.uncompressed_size,
-                               lu_val, lu, current_idx);
-                bdata = ce->data;
-            } else {
-                bdata = bdata_free = new_data;
-            }
-        }
-
-        /* Copy the overlapping byte range into the file buffer. */
-        off_t cstart = fstart > blk_ustart ? fstart : blk_ustart;
-        off_t cend   = fend   < blk_uend   ? fend   : blk_uend;
-        memcpy(buf   + (size_t)(cstart - fstart),
-               bdata + (size_t)(cstart - blk_ustart),
-               (size_t)(cend - cstart));
-        free(bdata_free);
-    } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
-}
+/* ---- streaming output helper ------------------------------------------ */
 
 /* Write the bytes of the file range [fstart, fend) directly to gOutFile,
- * decompressing lzma blocks on demand exactly as fill_file_buf() does but
- * without requiring a flat in-memory buffer of the full file size.
- * This keeps peak RSS bounded for very large archive members. */
+ * decompressing lzma blocks on demand.  Blocks with future consumers are
+ * stored in the Bélády cache so they are decompressed only once; blocks
+ * with no future consumer are used and freed immediately.
+ *
+ * If tail_zeros_out is non-NULL this function is additionally scanning for
+ * the tar end-of-archive boundary while streaming.  It walks forward through
+ * tar headers (each 512-byte header block followed by its rounded data) and
+ * stops writing as soon as it finds an all-zero header (the EOF marker),
+ * recording the number of trailing zeros in *tail_zeros_out.  This lets the
+ * caller reproduce exactly the trailing-zero bytes at the end of the sorted
+ * output without ever buffering the full file content in memory. */
 static void stream_file_to_output(off_t fstart, off_t fend,
                                   lzma_vli fio, bc_t *cache, lu_table_t *lu,
-                                  size_t current_idx, sort_stats_t *stats) {
+                                  size_t current_idx, sort_stats_t *stats,
+                                  size_t total_size, size_t *tail_zeros_out) {
+    /* State for the optional forward tar-header scan. */
+    off_t  eof_boundary  = fend;  /* updated once the EOF marker is found */
+    off_t  next_hdr_pos  = 0;     /* file-relative offset of the next header */
+    bool   eof_found     = false;
+
     lzma_index_iter iter;
     lzma_index_iter_init(&iter, gIndex);
     if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
@@ -1313,7 +1240,7 @@ static void stream_file_to_output(off_t fstart, off_t fend,
             continue;
 
         off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
-        if (blk_ustart >= fend)
+        if (blk_ustart >= eof_boundary)
             break;
         off_t blk_uend = blk_ustart + (off_t)iter.block.uncompressed_size;
 
@@ -1350,8 +1277,54 @@ static void stream_file_to_output(off_t fstart, off_t fend,
         }
 
         off_t cstart = fstart > blk_ustart ? fstart : blk_ustart;
-        off_t cend   = fend   < blk_uend   ? fend   : blk_uend;
-        size_t len   = (size_t)(cend - cstart);
+        off_t cend   = eof_boundary < blk_uend ? eof_boundary : blk_uend;
+
+        /* Forward tar-header scan: examine the bytes passing through this
+         * block to detect the EOF marker, updating eof_boundary and
+         * scan_file_pos as we go. */
+        if (tail_zeros_out && !eof_found) {
+            /* next_hdr_pos is file-relative; convert to absolute for
+             * comparison with cstart/cend. */
+            off_t abs_next = fstart + next_hdr_pos;
+            while (!eof_found && abs_next + TAR_BLOCK_SIZE <= cend) {
+                size_t boff = (size_t)(abs_next - blk_ustart);
+                const uint8_t *hdr = bdata + boff;
+
+                /* Check for all-zero header (EOF marker). */
+                size_t k;
+                for (k = 0; k < TAR_BLOCK_SIZE; k++)
+                    if (hdr[k] != 0) break;
+                if (k == TAR_BLOCK_SIZE) {
+                    /* Found the EOF marker: stop writing here. */
+                    eof_boundary = abs_next;
+                    cend = (eof_boundary < blk_uend)
+                           ? eof_boundary : blk_uend;
+                    *tail_zeros_out = (size_t)total_size
+                                      - (size_t)(eof_boundary - fstart);
+                    eof_found = true;
+                    break;
+                }
+
+                /* Parse the entry data size (octal or GNU base-256). */
+                uint64_t entry_size = 0;
+                if (hdr[124] & 0x80) {
+                    for (k = 1; k < 12; k++)
+                        entry_size = (entry_size << 8) | hdr[124 + k];
+                } else {
+                    for (k = 0; k < 12; k++) {
+                        uint8_t c = hdr[124 + k];
+                        if (c < '0' || c > '7') break;
+                        entry_size = entry_size * 8 + (c - '0');
+                    }
+                }
+
+                next_hdr_pos += TAR_BLOCK_SIZE
+                                + (off_t)ROUND_UP_TO_TAR_BLOCK(entry_size);
+                abs_next = fstart + next_hdr_pos;
+            }
+        }
+
+        size_t len = (size_t)(cend - cstart);
         if (len > 0 && fwrite(bdata + (size_t)(cstart - blk_ustart),
                               len, 1, gOutFile) != 1)
             die("Error writing sorted output");
@@ -1470,13 +1443,10 @@ void pixz_sorted_extract(void) {
 
     /* Extract and write files in sorted order.
      *
-     * For each file we fill a temporary buffer from the Bélády block cache,
-     * write it to gOutFile, then evict any cache blocks whose last consumer
-     * was just this file. */
+     * For each file we stream directly to gOutFile via the Bélády block cache,
+     * then evict any cache blocks whose last consumer was just this file. */
     bc_t   cache;
     bc_init(&cache);
-    uint8_t *fbuf     = NULL;
-    size_t   fbuf_cap = 0;
     sort_stats_t stats = { 0, 0, 0 };
 
     /* tail_zeros: the number of trailing zero bytes to write after all sorted
@@ -1488,110 +1458,15 @@ void pixz_sorted_extract(void) {
     size_t tail_zeros = 0;
 
     for (i = 0; i < count; ++i) {
-        size_t write_size = sizes[i];
-
         if (gVerbose && sorted[i]->name)
             fprintf(stderr, "%s\n", sorted[i]->name);
 
-        if (sizes[i] > FBUF_MAX) {
-            /* ---- Large-file streaming path --------------------------------
-             * For files whose uncompressed range exceeds FBUF_MAX, write
-             * blocks directly to gOutFile one at a time.  This keeps peak
-             * RSS bounded regardless of individual archive member size.
-             *
-             * The last-in-archive entry additionally carries trailing tar
-             * end-of-archive zeros; we locate the EOF boundary using a
-             * small header-scan buffer so we never need the full file in
-             * memory.  For files larger than HDR_SCAN_SIZE the forward
-             * parser exits the while-loop when pos advances past the scan
-             * boundary, computing write_size algebraically from the size
-             * field — correct because the EOF zeros are always beyond the
-             * scan region for any file > HDR_SCAN_SIZE bytes. */
-            if (i == last_in_archive_sorted_idx) {
-                size_t scan_size = (sizes[i] < HDR_SCAN_SIZE)
-                                   ? sizes[i] : HDR_SCAN_SIZE;
-                uint8_t hdr_scan[HDR_SCAN_SIZE];
-                fill_file_buf(hdr_scan, starts[i],
-                              starts[i] + (off_t)scan_size,
-                              fio, &cache, &lu, i, &stats);
-
-                size_t pos = 0;
-                while (pos + TAR_BLOCK_SIZE <= scan_size) {
-                    size_t k;
-                    for (k = 0; k < TAR_BLOCK_SIZE; k++)
-                        if (hdr_scan[pos + k] != 0) break;
-                    if (k == TAR_BLOCK_SIZE)
-                        break;
-
-                    uint64_t entry_size = 0;
-                    if (hdr_scan[pos + 124] & 0x80) {
-                        for (k = 1; k < 12; k++)
-                            entry_size = (entry_size << 8) | hdr_scan[pos + 124 + k];
-                    } else {
-                        for (k = 0; k < 12; k++) {
-                            uint8_t c = hdr_scan[pos + 124 + k];
-                            if (c < '0' || c > '7') break;
-                            entry_size = entry_size * 8 + (c - '0');
-                        }
-                    }
-                    pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
-                }
-
-                write_size = (pos <= sizes[i]) ? pos : sizes[i];
-                tail_zeros = sizes[i] - write_size;
-            }
-
-            if (write_size > 0)
-                stream_file_to_output(starts[i],
-                                      starts[i] + (off_t)write_size,
-                                      fio, &cache, &lu, i, &stats);
-        } else {
-            /* ---- Small-file buffer path -----------------------------------
-             * Buffer the whole range in fbuf (at most FBUF_MAX bytes), then
-             * trim EOF zeros for the last-in-archive entry via the forward
-             * parser, and finally fwrite the result in one call. */
-            if (sizes[i] > fbuf_cap) {
-                free(fbuf);
-                fbuf     = xmalloc(sizes[i]);
-                fbuf_cap = sizes[i];
-            }
-
-            fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
-                          fio, &cache, &lu, i, &stats);
-
-            /* Locate the tar EOF boundary for the last-in-archive entry.
-             * Walk FORWARD through headers; scanning backwards is wrong for
-             * files whose content ends with zero bytes. */
-            if (i == last_in_archive_sorted_idx) {
-                size_t pos = 0;
-                while (pos + TAR_BLOCK_SIZE <= write_size) {
-                    size_t k;
-                    for (k = 0; k < TAR_BLOCK_SIZE; k++)
-                        if (fbuf[pos + k] != 0) break;
-                    if (k == TAR_BLOCK_SIZE)
-                        break;
-
-                    uint64_t entry_size = 0;
-                    if (fbuf[pos + 124] & 0x80) {
-                        for (k = 1; k < 12; k++)
-                            entry_size = (entry_size << 8) | fbuf[pos + 124 + k];
-                    } else {
-                        for (k = 0; k < 12; k++) {
-                            uint8_t c = fbuf[pos + 124 + k];
-                            if (c < '0' || c > '7') break;
-                            entry_size = entry_size * 8 + (c - '0');
-                        }
-                    }
-                    pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
-                }
-
-                write_size = (pos <= sizes[i]) ? pos : sizes[i];
-                tail_zeros = sizes[i] - write_size;
-            }
-
-            if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
-                die("Error writing sorted output");
-        }
+        /* For the last-in-archive entry, pass &tail_zeros so that
+         * stream_file_to_output will run the forward tar-header scan inline
+         * and stop writing at the EOF marker rather than padding. */
+        size_t *tz = (i == last_in_archive_sorted_idx) ? &tail_zeros : NULL;
+        stream_file_to_output(starts[i], starts[i] + (off_t)sizes[i],
+                              fio, &cache, &lu, i, &stats, sizes[i], tz);
 
         /* Drop cache entries that no future file will need. */
         bc_evict_done(&cache, i);
@@ -1632,7 +1507,6 @@ void pixz_sorted_extract(void) {
 
     bc_free(&cache);
     lu_free(&lu);
-    free(fbuf);
     free(sorted);
     free(starts);
     free(sizes);
