@@ -808,6 +808,12 @@ typedef struct {
  * Set via the -D command-line option. */
 size_t gSortDictSize = 8 * 1024 * 1024;
 
+/* Bélády block cache size limits.  See pixz.h for semantics.
+ * When gBcMaxBytes > 0 it overrides gBcMaxEntries (RAM mode).
+ * gBcMaxEntries <= 0 (with gBcMaxBytes == 0) means unbounded. */
+ssize_t gBcMaxEntries = 32;
+size_t  gBcMaxBytes   = 0;
+
 static int cmp_sorted_files(const void *a, const void *b) {
     const file_index_t * const *fa = (const file_index_t * const *)a;
     const file_index_t * const *fb = (const file_index_t * const *)b;
@@ -1036,7 +1042,6 @@ static void lu_prune_single_user(lu_table_t *t) {
 #define BC_HASH_BITS    6
 #define BC_HASH_SIZE    (1 << BC_HASH_BITS)
 #define BC_HASH_MASK    (BC_HASH_SIZE - 1)
-#define BC_MAX_ENTRIES  32          /* maximum number of cached blocks */
 #define BC_HASH(off)    ((size_t)(off) & BC_HASH_MASK)
 
 typedef struct bc_entry_t bc_entry_t;
@@ -1051,6 +1056,7 @@ struct bc_entry_t {
 typedef struct {
     bc_entry_t *buckets[BC_HASH_SIZE];
     size_t      count;
+    size_t      total_bytes;  /* total decompressed bytes currently cached */
 } bc_t;
 
 static void bc_init(bc_t *c) { memset(c, 0, sizeof(*c)); }
@@ -1066,6 +1072,7 @@ static void bc_remove(bc_t *c, bc_entry_t *e) {
     bc_entry_t **pp = &c->buckets[BC_HASH(e->comp_off)];
     while (*pp && *pp != e) pp = &(*pp)->hash_next;
     if (*pp) *pp = e->hash_next;
+    c->total_bytes -= e->size;
     free(e->data);
     free(e);
     --c->count;
@@ -1090,17 +1097,31 @@ static void bc_evict_belady(bc_t *c, const lu_table_t *lu, size_t current_idx) {
     if (victim) bc_remove(c, victim);
 }
 
-/* Insert a decompressed block into the cache, taking ownership of data. */
+/* Insert a decompressed block into the cache, taking ownership of data.
+ * Evicts as needed to stay within gBcMaxBytes (RAM limit) or gBcMaxEntries
+ * (entry-count limit).  If both are zero/negative the cache is unbounded. */
 static bc_entry_t *bc_insert(bc_t *c, lzma_vli off,
                               uint8_t *data, size_t size, size_t last_user,
                               const lu_table_t *lu, size_t current_idx) {
-    if (c->count >= BC_MAX_ENTRIES) bc_evict_belady(c, lu, current_idx);
+    if (gBcMaxBytes > 0) {
+        /* RAM-based limit: evict until the new block fits, or until the cache
+         * is empty.  If the block alone exceeds gBcMaxBytes we still insert it
+         * (the data is needed) — the limit is best-effort in that edge case. */
+        while (c->count > 0 && c->total_bytes + size > gBcMaxBytes)
+            bc_evict_belady(c, lu, current_idx);
+    } else if (gBcMaxEntries > 0) {
+        /* Entry-count limit: evict one entry when the cap is reached. */
+        if (c->count >= (size_t)gBcMaxEntries)
+            bc_evict_belady(c, lu, current_idx);
+    }
+    /* gBcMaxEntries <= 0 and gBcMaxBytes == 0: unbounded — never evict. */
     bc_entry_t *e = xmalloc(sizeof(bc_entry_t));
     e->comp_off = off;
     e->data = data; e->size = size; e->last_user = last_user;
     e->hash_next = c->buckets[BC_HASH(off)];
     c->buckets[BC_HASH(off)] = e;
     ++c->count;
+    c->total_bytes += size;
     return e;
 }
 

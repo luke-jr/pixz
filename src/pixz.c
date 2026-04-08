@@ -53,6 +53,9 @@ static void usage(const char *msg) {
 "  -D SIZE            Size threshold for classifying large files (used with -S);\n"
 "                     files >= SIZE are sorted last; SIZE is in MiB when no suffix given;\n"
 "                     K/M/G accepted (default: 8 MiB)\n"
+"  -C LIMIT           Bélády block-cache limit for -S (default: 32 entries);\n"
+"                     plain number = max cached blocks (-1 or 0 for unbounded);\n"
+"                     with K/M/G suffix = max RAM for cached blocks (e.g. 512M)\n"
 "  -V                 Print version and exit\n"
 "  -h                 Print this help\n"
 "\n"
@@ -84,7 +87,8 @@ int main(int argc, char **argv) {
 	long optint;
     double optdbl;
     bool sort_dict_set = false;
-    while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:eD:")) != -1) {
+    bool bc_limit_set = false;
+    while ((ch = getopt(argc, argv, "dcxlSi:o:tkvVhp:0123456789f:q:eD:C:")) != -1) {
         switch (ch) {
             case 'c': break;
             case 'd': op = OP_READ; break;
@@ -115,6 +119,36 @@ int main(int argc, char **argv) {
                     usage("Value too large for -D");
                 gSortDictSize = (size_t)(val * mult);
                 sort_dict_set = true;
+                break;
+            }
+            case 'C': {
+                char *end;
+                long cval = strtol(optarg, &end, 10);
+                if (end == optarg)
+                    usage("Need an integer argument to -C");
+                if (*end == '\0') {
+                    /* Plain integer: entry-count limit (-1 or 0 = unbounded). */
+                    if (cval < -1)
+                        usage("Invalid argument to -C; use -1 or 0 for unbounded");
+                    gBcMaxEntries = (ssize_t)cval;
+                    gBcMaxBytes   = 0;
+                } else {
+                    /* Suffixed value: RAM-based limit. */
+                    if (cval <= 0)
+                        usage("Need a positive integer for -C with a size suffix");
+                    size_t mult;
+                    if      (*end == 'K' || *end == 'k') { mult = 1024UL;                ++end; }
+                    else if (*end == 'M' || *end == 'm') { mult = 1024UL * 1024;         ++end; }
+                    else if (*end == 'G' || *end == 'g') { mult = 1024UL * 1024 * 1024; ++end; }
+                    else usage("Invalid suffix for -C; use K, M, or G, or no suffix for entry count");
+                    if (*end)
+                        usage("Invalid suffix for -C; use K, M, or G");
+                    if ((unsigned long)cval > (unsigned long)(SIZE_MAX / mult))
+                        usage("Value too large for -C");
+                    gBcMaxBytes   = (size_t)((unsigned long)cval * mult);
+                    gBcMaxEntries = 0;
+                }
+                bc_limit_set = true;
                 break;
             }
             case 'i': ipath = optarg; break;
@@ -155,6 +189,8 @@ int main(int argc, char **argv) {
 
     if (sort_dict_set && op != OP_SORT_EXTRACT)
         usage("-D is only meaningful with -S");
+    if (bc_limit_set && op != OP_SORT_EXTRACT)
+        usage("-C is only meaningful with -S");
 
     /* Default dict size: ask liblzma what LZMA_PRESET_DEFAULT uses. */
     if (!sort_dict_set) {

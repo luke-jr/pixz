@@ -76,6 +76,14 @@ extern double gBlockFraction;
  * Set via -D; defaults to 8 MiB. */
 extern size_t gSortDictSize;
 
+/* Bélády block cache limits for -S sorted extract (set via -C).
+ * gBcMaxEntries: maximum number of cached blocks; -1 or 0 = unbounded.
+ * gBcMaxBytes:   maximum total bytes of decompressed data in the cache;
+ *                0 = not set (use gBcMaxEntries instead).
+ * When gBcMaxBytes > 0 it takes precedence over gBcMaxEntries. */
+extern ssize_t gBcMaxEntries;
+extern size_t  gBcMaxBytes;
+
 void *xmalloc(size_t size);
 
 #pragma mark INDEX
