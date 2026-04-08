@@ -1281,7 +1281,7 @@ void pixz_sorted_extract(void) {
     sa.sa_handler = sigusr1_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
-    sigaction(SIGUSR1, &sa, &old_sa);
+    bool sigusr1_installed = (sigaction(SIGUSR1, &sa, &old_sa) == 0);
 
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
