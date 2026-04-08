@@ -2,6 +2,7 @@
 
 #include <archive.h>
 #include <archive_entry.h>
+#include <signal.h>
 
 
 #pragma mark DECLARE WANTED
@@ -1271,7 +1272,17 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
  * access list (built in one prepass) drives both the proactive eviction
  * (bc_evict_done) and the Bélády fallback (bc_evict_belady): when the cache
  * is full, the entry whose *next* consumer is furthest ahead is evicted. */
+
+static volatile sig_atomic_t sSortStatsPrint = 0;
+static void sigusr1_handler(int sig) { (void)sig; sSortStatsPrint = 1; }
+
 void pixz_sorted_extract(void) {
+    struct sigaction sa, old_sa;
+    sa.sa_handler = sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa, &old_sa);
+
     if (!decode_index())
         die("Can't perform sorted extract on non-seekable input");
 
@@ -1287,6 +1298,7 @@ void pixz_sorted_extract(void) {
     if (count == 0) {
         free_file_index();
         lzma_index_end(gIndex, NULL);
+        sigaction(SIGUSR1, &old_sa, NULL);
         return;
     }
 
@@ -1426,6 +1438,14 @@ void pixz_sorted_extract(void) {
 
         /* Drop cache entries that no future file will need. */
         bc_evict_done(&cache, i);
+
+        if (sSortStatsPrint) {
+            sSortStatsPrint = 0;
+            fprintf(stderr, "sorted-extract stats [%zu/%zu]: decompressions=%zu"
+                    "  cache_hits=%zu  redecompressions=%zu\n",
+                    i + 1, count,
+                    stats.decompressions, stats.cache_hits, stats.redecompressions);
+        }
     }
 
     /* Write the trailing zero bytes from the original archive (may be fewer
@@ -1451,5 +1471,6 @@ void pixz_sorted_extract(void) {
     free(sizes);
     free_file_index();
     lzma_index_end(gIndex, NULL);
+    sigaction(SIGUSR1, &old_sa, NULL);
 }
 

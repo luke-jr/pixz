@@ -49,6 +49,7 @@ static void usage(const char *msg) {
 "  -c                 ignored\n"
 "  -S                 Extract sorted by file type then filename (for re-compression)\n"
 "  -S -l              Same, but list each file and print cache stats to stderr\n"
+"                     Send SIGUSR1 to print running cache stats at any time during -S\n"
 "  -D SIZE            Dictionary size of the recompressor (used with -S);\n"
 "                     SIZE is in MiB when no suffix given; K/M/G accepted\n"
 "                     (default: matches liblzma default preset)\n"
