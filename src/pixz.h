@@ -72,7 +72,7 @@ size_t num_threads(void);
 
 extern double gBlockFraction;
 
-/* Dictionary size of the recompressor that will consume -S output.
+/* LZMA dictionary size used as the large-file threshold for -S sorted extract.
  * Set via -D; defaults to 8 MiB (xz/pixz level -6). */
 extern size_t gSortDictSize;
 

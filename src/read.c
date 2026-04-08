@@ -802,11 +802,12 @@ typedef struct {
     size_t redecompressions; /* blocks decompressed >1 time due to eviction */
 } sort_stats_t;
 
-/* Dictionary size of the *recompressor* that will consume the sorted output.
+/* LZMA dictionary size used as the large-file threshold for sorted extract.
  * Files larger than this threshold flush a full dictionary window on their own
  * and gain nothing from adjacency; they are sorted last to avoid disrupting
  * runs of compressible small files.  Default is 8 MiB (xz/pixz level -6).
- * Set via the -D command-line option to match the intended recompressor. */
+ * Set via the -D command-line option to match the dictionary size of whatever
+ * compressor will consume the sorted output. */
 size_t gSortDictSize = 8 * 1024 * 1024;
 
 static int cmp_sorted_files(const void *a, const void *b) {
