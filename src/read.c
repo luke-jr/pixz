@@ -797,9 +797,9 @@ static const char *file_type_ext(const char *name) {
 /* Counters for monitoring block (re-)decompression during sorted extract.
  * Printed to stderr at the end of pixz_sorted_extract when DEBUG is enabled. */
 typedef struct {
-    size_t decompressions;   /* total calls to decompress_block_at */
+    size_t decompressions;   /* first-time decompress calls (not redecompressions) */
     size_t cache_hits;       /* blocks served from the Bélády cache */
-    size_t redecompressions; /* blocks decompressed >1 time due to eviction */
+    size_t redecompressions; /* blocks decompressed again after cache eviction */
 } sort_stats_t;
 
 /* Size threshold for classifying large files during sorted extract.
@@ -1234,10 +1234,14 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
             if (!iter.stream.flags)
                 die("Missing stream flags for block");
             /* Count re-decompressions: shared blocks (in lu_table) that have
-             * already been decompressed once but were evicted from the cache. */
+             * already been decompressed once but were evicted from the cache.
+             * decompressions and redecompressions are mutually exclusive so
+             * that decompressions + cache_hits + redecompressions == total
+             * block accesses. */
             if (lu_is_seen(lu, iter.block.compressed_file_offset))
                 stats->redecompressions++;
-            stats->decompressions++;
+            else
+                stats->decompressions++;
             uint8_t *new_data = decompress_block_at(
                 iter.block.compressed_file_offset,
                 iter.stream.flags->check,
