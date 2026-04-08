@@ -708,6 +708,19 @@ static bool taste_file_index(io_block_t *ib) {
 #define ROUND_UP_TO_TAR_BLOCK(n) \
     (((size_t)(n) + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
 
+/* Maximum uncompressed file range that is buffered in a flat allocation.
+ * Files whose range exceeds this threshold are written directly to gOutFile
+ * one lzma block at a time, keeping peak memory bounded regardless of the
+ * size of individual archive members.  256 MiB is generous enough for
+ * virtually all source trees and package archives while preventing the
+ * multi-GB allocations that cause OOM for very large archive members. */
+#define FBUF_MAX ((size_t)(256 * 1024 * 1024))   /* 256 MiB */
+
+/* Bytes of the file range read into a temporary buffer solely to locate
+ * the tar EOF boundary.  512 bytes (one tar header) is the minimum; using
+ * 4 KiB accommodates PAX extended header blocks (~1.5 KiB) with margin. */
+#define HDR_SCAN_SIZE 4096
+
 /* Return the extension (including the leading dot) from the last path
  * component.  Uses the *last non-numeric* dot component so that:
  *  - Dots in version-number stems (e.g. "libstdc++6-4.4-dev_4.4.5-8_i386.deb")
@@ -1206,7 +1219,7 @@ static uint8_t *decompress_block_at(lzma_vli comp_off, lzma_check check,
 }
 
 
-/* ---- per-file buffer fill --------------------------------------------- */
+/* ---- per-file buffer fill and streaming output ------------------------ */
 
 /* Copy the bytes of one file [fstart, fend) from lzma blocks into buf.
  * Blocks with future consumers are fetched from (or added to) the Bélády
@@ -1278,6 +1291,70 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
         memcpy(buf   + (size_t)(cstart - fstart),
                bdata + (size_t)(cstart - blk_ustart),
                (size_t)(cend - cstart));
+        free(bdata_free);
+    } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
+}
+
+/* Write the bytes of the file range [fstart, fend) directly to gOutFile,
+ * decompressing lzma blocks on demand exactly as fill_file_buf() does but
+ * without requiring a flat in-memory buffer of the full file size.
+ * This keeps peak RSS bounded for very large archive members. */
+static void stream_file_to_output(off_t fstart, off_t fend,
+                                  lzma_vli fio, bc_t *cache, lu_table_t *lu,
+                                  size_t current_idx, sort_stats_t *stats) {
+    lzma_index_iter iter;
+    lzma_index_iter_init(&iter, gIndex);
+    if (lzma_index_iter_locate(&iter, (lzma_vli)fstart))
+        die("Can't locate block for uncompressed offset %jd",
+            (intmax_t)fstart);
+
+    do {
+        if (iter.block.compressed_file_offset == fio)
+            continue;
+
+        off_t blk_ustart = (off_t)iter.block.uncompressed_file_offset;
+        if (blk_ustart >= fend)
+            break;
+        off_t blk_uend = blk_ustart + (off_t)iter.block.uncompressed_size;
+
+        bc_entry_t *ce = bc_lookup(cache, iter.block.compressed_file_offset);
+        uint8_t *bdata_free = NULL;
+        const uint8_t *bdata;
+        if (ce) {
+            stats->cache_hits++;
+            bdata = ce->data;
+        } else {
+            if (!iter.stream.flags)
+                die("Missing stream flags for block");
+            if (lu_is_seen(lu, iter.block.compressed_file_offset))
+                stats->redecompressions++;
+            else
+                stats->decompressions++;
+            uint8_t *new_data = decompress_block_at(
+                iter.block.compressed_file_offset,
+                iter.stream.flags->check,
+                (size_t)iter.block.uncompressed_size);
+            if (lu_next_user(lu, iter.block.compressed_file_offset,
+                             current_idx) != SIZE_MAX) {
+                lu_mark_seen(lu, iter.block.compressed_file_offset);
+                size_t lu_val = lu_last_user(lu,
+                                    iter.block.compressed_file_offset);
+                ce = bc_insert(cache,
+                               iter.block.compressed_file_offset,
+                               new_data, (size_t)iter.block.uncompressed_size,
+                               lu_val, lu, current_idx);
+                bdata = ce->data;
+            } else {
+                bdata = bdata_free = new_data;
+            }
+        }
+
+        off_t cstart = fstart > blk_ustart ? fstart : blk_ustart;
+        off_t cend   = fend   < blk_uend   ? fend   : blk_uend;
+        size_t len   = (size_t)(cend - cstart);
+        if (len > 0 && fwrite(bdata + (size_t)(cstart - blk_ustart),
+                              len, 1, gOutFile) != 1)
+            die("Error writing sorted output");
         free(bdata_free);
     } while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK));
 }
@@ -1411,69 +1488,110 @@ void pixz_sorted_extract(void) {
     size_t tail_zeros = 0;
 
     for (i = 0; i < count; ++i) {
-        /* Grow the per-file working buffer on demand. */
-        if (sizes[i] > fbuf_cap) {
-            free(fbuf);
-            fbuf     = xmalloc(sizes[i]);
-            fbuf_cap = sizes[i];
-        }
-
-        fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
-                      fio, &cache, &lu, i, &stats);
-
-        /* The entry that is last in archive order carries trailing tar
-         * end-of-archive zeros in its size (two-block EOF marker plus any
-         * blocking-factor padding added by tar).  Trim those zeros so they
-         * do not appear in the middle of the sorted output stream, and record
-         * how many were trimmed so we can restore them at the end.
-         *
-         * We locate the boundary by walking FORWARD through the buffer,
-         * parsing each tar header to skip exactly over its data blocks,
-         * until we reach a 512-byte all-zero block (the first EOF marker).
-         * Scanning backwards for zeros is wrong: it corrupts files whose
-         * content ends with zero bytes, replacing actual data with extra
-         * zeros at the tail of the archive. */
         size_t write_size = sizes[i];
-        if (i == last_in_archive_sorted_idx) {
-            size_t pos = 0;
-            while (pos + TAR_BLOCK_SIZE <= write_size) {
-                /* Check whether the block at `pos` is the all-zero EOF
-                 * marker.  Use a manual loop so we can break early. */
-                size_t k;
-                for (k = 0; k < TAR_BLOCK_SIZE; k++)
-                    if (fbuf[pos + k] != 0) break;
-                if (k == TAR_BLOCK_SIZE)
-                    break; /* found the EOF region */
-
-                /* Read the entry data size from the octal field at offset
-                 * 124 within the 512-byte header block.  GNU tar encodes
-                 * sizes > 8 GiB in base-256 (first byte has bit 7 set). */
-                uint64_t entry_size = 0;
-                if (fbuf[pos + 124] & 0x80) {
-                    /* base-256: 11 value bytes follow the flag byte */
-                    for (k = 1; k < 12; k++)
-                        entry_size = (entry_size << 8) | fbuf[pos + 124 + k];
-                } else {
-                    for (k = 0; k < 12; k++) {
-                        uint8_t c = fbuf[pos + 124 + k];
-                        if (c < '0' || c > '7') break;
-                        entry_size = entry_size * 8 + (c - '0');
-                    }
-                }
-
-                /* Advance past this header block and its padded data. */
-                pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
-            }
-
-            write_size = (pos <= sizes[i]) ? pos : sizes[i];
-            tail_zeros = sizes[i] - write_size;
-        }
 
         if (gVerbose && sorted[i]->name)
             fprintf(stderr, "%s\n", sorted[i]->name);
 
-        if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
-            die("Error writing sorted output");
+        if (sizes[i] > FBUF_MAX) {
+            /* ---- Large-file streaming path --------------------------------
+             * For files whose uncompressed range exceeds FBUF_MAX, write
+             * blocks directly to gOutFile one at a time.  This keeps peak
+             * RSS bounded regardless of individual archive member size.
+             *
+             * The last-in-archive entry additionally carries trailing tar
+             * end-of-archive zeros; we locate the EOF boundary using a
+             * small header-scan buffer so we never need the full file in
+             * memory.  For files larger than HDR_SCAN_SIZE the forward
+             * parser exits the while-loop when pos advances past the scan
+             * boundary, computing write_size algebraically from the size
+             * field — correct because the EOF zeros are always beyond the
+             * scan region for any file > HDR_SCAN_SIZE bytes. */
+            if (i == last_in_archive_sorted_idx) {
+                size_t scan_size = (sizes[i] < HDR_SCAN_SIZE)
+                                   ? sizes[i] : HDR_SCAN_SIZE;
+                uint8_t hdr_scan[HDR_SCAN_SIZE];
+                fill_file_buf(hdr_scan, starts[i],
+                              starts[i] + (off_t)scan_size,
+                              fio, &cache, &lu, i, &stats);
+
+                size_t pos = 0;
+                while (pos + TAR_BLOCK_SIZE <= scan_size) {
+                    size_t k;
+                    for (k = 0; k < TAR_BLOCK_SIZE; k++)
+                        if (hdr_scan[pos + k] != 0) break;
+                    if (k == TAR_BLOCK_SIZE)
+                        break;
+
+                    uint64_t entry_size = 0;
+                    if (hdr_scan[pos + 124] & 0x80) {
+                        for (k = 1; k < 12; k++)
+                            entry_size = (entry_size << 8) | hdr_scan[pos + 124 + k];
+                    } else {
+                        for (k = 0; k < 12; k++) {
+                            uint8_t c = hdr_scan[pos + 124 + k];
+                            if (c < '0' || c > '7') break;
+                            entry_size = entry_size * 8 + (c - '0');
+                        }
+                    }
+                    pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
+                }
+
+                write_size = (pos <= sizes[i]) ? pos : sizes[i];
+                tail_zeros = sizes[i] - write_size;
+            }
+
+            if (write_size > 0)
+                stream_file_to_output(starts[i],
+                                      starts[i] + (off_t)write_size,
+                                      fio, &cache, &lu, i, &stats);
+        } else {
+            /* ---- Small-file buffer path -----------------------------------
+             * Buffer the whole range in fbuf (at most FBUF_MAX bytes), then
+             * trim EOF zeros for the last-in-archive entry via the forward
+             * parser, and finally fwrite the result in one call. */
+            if (sizes[i] > fbuf_cap) {
+                free(fbuf);
+                fbuf     = xmalloc(sizes[i]);
+                fbuf_cap = sizes[i];
+            }
+
+            fill_file_buf(fbuf, starts[i], starts[i] + (off_t)sizes[i],
+                          fio, &cache, &lu, i, &stats);
+
+            /* Locate the tar EOF boundary for the last-in-archive entry.
+             * Walk FORWARD through headers; scanning backwards is wrong for
+             * files whose content ends with zero bytes. */
+            if (i == last_in_archive_sorted_idx) {
+                size_t pos = 0;
+                while (pos + TAR_BLOCK_SIZE <= write_size) {
+                    size_t k;
+                    for (k = 0; k < TAR_BLOCK_SIZE; k++)
+                        if (fbuf[pos + k] != 0) break;
+                    if (k == TAR_BLOCK_SIZE)
+                        break;
+
+                    uint64_t entry_size = 0;
+                    if (fbuf[pos + 124] & 0x80) {
+                        for (k = 1; k < 12; k++)
+                            entry_size = (entry_size << 8) | fbuf[pos + 124 + k];
+                    } else {
+                        for (k = 0; k < 12; k++) {
+                            uint8_t c = fbuf[pos + 124 + k];
+                            if (c < '0' || c > '7') break;
+                            entry_size = entry_size * 8 + (c - '0');
+                        }
+                    }
+                    pos += TAR_BLOCK_SIZE + ROUND_UP_TO_TAR_BLOCK(entry_size);
+                }
+
+                write_size = (pos <= sizes[i]) ? pos : sizes[i];
+                tail_zeros = sizes[i] - write_size;
+            }
+
+            if (write_size > 0 && fwrite(fbuf, write_size, 1, gOutFile) != 1)
+                die("Error writing sorted output");
+        }
 
         /* Drop cache entries that no future file will need. */
         bc_evict_done(&cache, i);
