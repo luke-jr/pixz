@@ -1079,15 +1079,24 @@ static void bc_remove(bc_t *c, bc_entry_t *e) {
 }
 
 /* Evict the entry whose *next* consumer is furthest ahead (true Bélády).
- * Uses lu_next_user_from (>= current_idx) so that blocks still needed during
- * the current file's iteration are never chosen as victims (their distance is
- * current_idx — the smallest possible).  O(BC_MAX_ENTRIES) per call. */
+ * Uses lu_next_user (> current_idx, strictly) so that blocks whose last user
+ * IS current_idx — but have already been served earlier in the current file's
+ * lzma-block iteration — appear with next_use = SIZE_MAX and become the
+ * preferred eviction target.  Using >= instead would give those dead blocks
+ * next_use = current_idx (the smallest possible value), falsely marking them
+ * as "hot" and causing a genuinely useful block to be evicted instead, which
+ * produces a spurious re-decompression on that block's next access.
+ *
+ * A block still needed later in the current file's iteration (users include
+ * current_idx AND some future index j) correctly shows next_use = j with >,
+ * not current_idx with >=, so it is still protected from eviction when j is
+ * closer than other candidates.  O(BC_MAX_ENTRIES) per call. */
 static void bc_evict_belady(bc_t *c, const lu_table_t *lu, size_t current_idx) {
     bc_entry_t *victim = NULL;
     size_t victim_next = 0;
     for (int h = 0; h < BC_HASH_SIZE; ++h) {
         for (bc_entry_t *e = c->buckets[h]; e; e = e->hash_next) {
-            size_t nxt = lu_next_user_from(lu, e->comp_off, current_idx);
+            size_t nxt = lu_next_user(lu, e->comp_off, current_idx);
             if (!victim || nxt > victim_next) {
                 victim = e;
                 victim_next = nxt;
