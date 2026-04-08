@@ -178,6 +178,7 @@ lzma_vli read_file_index() {
         file_index_t *f = xmalloc(sizeof(file_index_t));
         f->name = strlen(name) ? xstrdup(name) : NULL;
         f->offset = xle64dec(gFileIndexBuf + gFIBPos);
+        f->next = NULL;
         gFIBPos += sizeof(uint64_t);
         
         if (gLastFile) {
