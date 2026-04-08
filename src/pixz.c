@@ -50,7 +50,7 @@ static void usage(const char *msg) {
 "  -S                 Extract sorted by file type then filename (for re-compression)\n"
 "  -S -l              Same, but list each file and print cache stats to stderr\n"
 "  -D SIZE            Dictionary size of the recompressor (used with -S);\n"
-"                     SIZE is in bytes with optional K/M/G suffix\n"
+"                     SIZE is in MiB when no suffix given; K/M/G accepted\n"
 "                     (default: matches liblzma default preset)\n"
 "  -V                 Print version and exit\n"
 "  -h                 Print this help\n"
@@ -104,13 +104,13 @@ int main(int argc, char **argv) {
                 unsigned long val = strtoul(optarg, &end, 10);
                 if (end == optarg || val == 0)
                     usage("Need a positive integer argument to -D");
-                unsigned long mult = 1;
+                unsigned long mult = 1024UL * 1024; /* default: MiB */
                 if (*end == 'K' || *end == 'k') { mult = 1024UL; ++end; }
                 else if (*end == 'M' || *end == 'm') { mult = 1024UL * 1024; ++end; }
                 else if (*end == 'G' || *end == 'g') { mult = 1024UL * 1024 * 1024; ++end; }
                 if (*end)
                     usage("Invalid suffix for -D; use K, M, or G");
-                if (mult > 1 && val > (unsigned long)(SIZE_MAX / mult))
+                if (val > (unsigned long)(SIZE_MAX / mult))
                     usage("Value too large for -D");
                 gSortDictSize = (size_t)(val * mult);
                 sort_dict_set = true;
