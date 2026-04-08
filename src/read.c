@@ -802,12 +802,10 @@ typedef struct {
     size_t redecompressions; /* blocks decompressed >1 time due to eviction */
 } sort_stats_t;
 
-/* LZMA dictionary size used as the large-file threshold for sorted extract.
- * Files larger than this threshold flush a full dictionary window on their own
- * and gain nothing from adjacency; they are sorted last to avoid disrupting
- * runs of compressible small files.  Default is 8 MiB (xz/pixz level -6).
- * Set via the -D command-line option to match the dictionary size of whatever
- * compressor will consume the sorted output. */
+/* Size threshold for classifying large files during sorted extract.
+ * Files larger than this threshold are sorted last to avoid disrupting
+ * runs of compressible small files.  Default is 8 MiB.
+ * Set via the -D command-line option. */
 size_t gSortDictSize = 8 * 1024 * 1024;
 
 static int cmp_sorted_files(const void *a, const void *b) {
@@ -835,17 +833,21 @@ static int cmp_sorted_files(const void *a, const void *b) {
     int hb = (sb <= TAR_BLOCK_SIZE);
     if (ha != hb) return hb - ha;   /* 1 (header-only) sorts before 0 */
 
-    /* Primary: small files (< dict size) sort before large files.
-     * Large files flush the LZMA dictionary entirely on their own, so they
-     * gain nothing from adjacency to other files; isolating them prevents them
-     * from breaking up runs of compressible content. */
+    /* Both header-only: no data content, so extension grouping is pointless.
+     * Sort by filename only for a stable, predictable order. */
+    if (ha && hb) return strcmp(na, nb);
+
+    /* Primary: small files (< threshold) sort before large files.
+     * Large files flush the compressor dictionary entirely on their own, so
+     * they gain nothing from adjacency to other files; isolating them prevents
+     * them from breaking up runs of compressible content. */
     int la = (sa >= (off_t)gSortDictSize);
     int lb = (sb >= (off_t)gSortDictSize);
     if (la != lb) return la - lb;   /* 0 (small) sorts before 1 (large) */
 
     /* Secondary: group globally by extension.  This keeps all .c files
      * together, all .py files together, etc., across the whole archive,
-     * building a richer LZMA dictionary for each file type. */
+     * building a richer compressor dictionary for each file type. */
     int r = strcmp(file_type_ext(na), file_type_ext(nb));
     if (r != 0) return r;
 
@@ -1254,17 +1256,19 @@ static void fill_file_buf(uint8_t *buf, off_t fstart, off_t fend,
  *
  * Sort key: (is_header_only, is_large, extension, directory, name).
  *   is_header_only – dirs, symlinks, hard links, devices, FIFOs, and 0-byte
- *                files (span <= 512 bytes) sort first.  In a typical tar such
- *                entries immediately precede the files they contain, sharing
- *                an lzma block with them.  Sorting them first keeps them as
- *                early (not late) consumers of shared blocks, so lu_last_user
- *                is unaffected and cache pressure is minimised.
- *   is_large   – files >= dict_size go last; they flush the LZMA dictionary
- *                entirely on their own and gain nothing from adjacency.
+ *                files (span <= 512 bytes) sort first, and among themselves
+ *                are ordered by filename only (no extension or size tiers).
+ *                In a typical tar such entries immediately precede the files
+ *                they contain, sharing a compressed block with them.  Sorting
+ *                them first keeps them as early (not late) consumers of shared
+ *                blocks, so lu_last_user is unaffected and cache pressure is
+ *                minimised.
+ *   is_large   – files >= threshold go last; they gain nothing from adjacency
+ *                to other files and would disrupt runs of compressible content.
  *   extension  – groups globally similar types (all .c together, all .py
- *                together), giving LZMA a rich shared dictionary per type.
+ *                together), giving the compressor a rich shared context per type.
  *   directory  – within the same type, same-directory files share
- *                project-specific identifiers that LZMA exploits well.
+ *                project-specific identifiers the compressor exploits well.
  *   name       – stable tie-breaker.
  *
  * Bélády-optimal decompression cache: blocks shared by multiple files are

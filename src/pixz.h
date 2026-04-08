@@ -72,8 +72,8 @@ size_t num_threads(void);
 
 extern double gBlockFraction;
 
-/* LZMA dictionary size used as the large-file threshold for -S sorted extract.
- * Set via -D; defaults to 8 MiB (xz/pixz level -6). */
+/* Size threshold for classifying large files for -S sorted extract.
+ * Set via -D; defaults to 8 MiB. */
 extern size_t gSortDictSize;
 
 void *xmalloc(size_t size);
