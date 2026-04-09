@@ -814,6 +814,46 @@ size_t gSortDictSize = 8 * 1024 * 1024;
 ssize_t gBcMaxEntries = 32;
 size_t  gBcMaxBytes   = 0;
 
+/* Compare two file paths right-to-left, one component at a time.
+ * The comparison order is: basename, then the directory containing it,
+ * then that directory's parent, all the way up to the root.
+ *
+ * This groups files that share a basename (e.g. "models.py") together
+ * across different parent directories, then files in same-named directories
+ * together, etc.  A shallower path (fewer components) sorts before a deeper
+ * one when all trailing components are identical. */
+static int cmp_path_reversed(const char *a, const char *ea,
+                              const char *b, const char *eb) {
+    /* Strip a trailing '/' from the current end pointer (safety; paths in a
+     * tar index should not end with '/' for regular files, but be defensive). */
+    while (ea > a && ea[-1] == '/') --ea;
+    while (eb > b && eb[-1] == '/') --eb;
+
+    /* Find the start of the rightmost component in each path. */
+    const char *sa = ea;
+    while (sa > a && sa[-1] != '/') --sa;
+    const char *sb = eb;
+    while (sb > b && sb[-1] != '/') --sb;
+
+    /* Compare just this component. */
+    size_t la = (size_t)(ea - sa);
+    size_t lb = (size_t)(eb - sb);
+    int r = strncmp(sa, sb, la < lb ? la : lb);
+    if (r != 0) return r;
+    if (la != lb) return (la < lb) ? -1 : 1;
+
+    /* This component is equal.  Recurse into parent directories. */
+    int has_parent_a = (sa > a);   /* sa[-1] == '/' if true */
+    int has_parent_b = (sb > b);
+
+    if (!has_parent_a && !has_parent_b) return 0;
+    if (!has_parent_a) return -1;  /* a is shallower → sorts before b */
+    if (!has_parent_b) return  1;
+
+    /* Move end pointers back past the '/' separator and recurse. */
+    return cmp_path_reversed(a, sa - 1, b, sb - 1);
+}
+
 static int cmp_sorted_files(const void *a, const void *b) {
     const file_index_t * const *fa = (const file_index_t * const *)a;
     const file_index_t * const *fb = (const file_index_t * const *)b;
@@ -857,11 +897,15 @@ static int cmp_sorted_files(const void *a, const void *b) {
     int r = strcmp(file_type_ext(na), file_type_ext(nb));
     if (r != 0) return r;
 
-    /* Tertiary: within the same extension, group by full path.  strcmp on the
-     * complete path naturally clusters same-directory files together (they
-     * share an identical prefix through the last '/') while also providing a
-     * stable total order within each directory. */
-    return strcmp(na, nb);
+    /* Tertiary: within the same extension, compare path components
+     * right-to-left (basename first, then parent directory, then
+     * grandparent, up to the root).  This groups files with identical
+     * basenames together across different top-level directories, then
+     * files in same-named directories together, etc., maximising the
+     * chance that the LZMA back-reference window can reach identical
+     * content from a sibling container.  Shallower paths sort before
+     * deeper ones when all right-aligned components are equal. */
+    return cmp_path_reversed(na, na + strlen(na), nb, nb + strlen(nb));
 }
 
 
