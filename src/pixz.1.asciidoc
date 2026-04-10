@@ -29,7 +29,12 @@ By default, pixz uses standard input and output, unless 'INPUT' and 'OUTPUT' arg
   List the archive contents. In tarball mode, lists the files in the tarball. In non-tarball mode, lists the blocks of compressed data.
 
 *-v*::
-  Verbose listing. When used with *-l* in tarball mode, prints the compressed block offset and uncompressed tar offset for each file, in the format: `compressed_offset uncompressed_offset filename`.
+  Verbose listing. When used with *-l* in tarball mode, prints four columns per
+  file: the compressed file offset of the containing LZMA block, the uncompressed
+  byte offset of the file within that block, the total uncompressed size of that
+  block, and the filename. Format: `block_compressed_offset uncompressed_offset_in_block block_uncompressed_size filename`.
+  To decompress a specific file: seek to `block_compressed_offset` in the archive,
+  decompress the block, and skip `uncompressed_offset_in_block` bytes.
 
 *-x* 'PATH'::
   Extract certain members from an archive, quickly. All members whose path begins with 'PATH' will be extracted.

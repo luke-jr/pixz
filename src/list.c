@@ -19,9 +19,12 @@ void pixz_list(bool tar) {
                 if (lzma_index_iter_locate(&viter, (lzma_vli)f->offset))
                     die("Can't locate block for uncompressed offset %"PRIuMAX,
                         (uintmax_t)f->offset);
-                printf("%"PRIuMAX" %"PRIuMAX" %s\n",
+                lzma_vli uoffset_in_block = (lzma_vli)f->offset
+                    - viter.block.uncompressed_file_offset;
+                printf("%"PRIuMAX" %"PRIuMAX" %"PRIuMAX" %s\n",
                     (uintmax_t)viter.block.compressed_file_offset,
-                    (uintmax_t)f->offset,
+                    (uintmax_t)uoffset_in_block,
+                    (uintmax_t)viter.block.uncompressed_size,
                     f->name);
             }
         } else {
