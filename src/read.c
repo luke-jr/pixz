@@ -797,9 +797,12 @@ static const char *file_type_ext(const char *name) {
 /* Counters for monitoring block (re-)decompression during sorted extract.
  * Printed to stderr at the end of pixz_sorted_extract when DEBUG is enabled. */
 typedef struct {
-    size_t decompressions;   /* first-time decompress calls (not redecompressions) */
-    size_t cache_hits;       /* blocks served from the Bélády cache */
-    size_t redecompressions; /* blocks decompressed again after cache eviction */
+    size_t decompressions;        /* first-time decompress calls (not redecompressions) */
+    size_t cache_hits;            /* blocks served from the Bélády cache */
+    size_t redecompressions;      /* blocks decompressed again after cache eviction */
+    uint64_t decompressed_bytes;  /* uncompressed bytes from first-time decompressions */
+    uint64_t redecompressed_bytes;/* uncompressed bytes from re-decompressions */
+    uint64_t cache_hit_bytes;     /* uncompressed bytes served from cache */
 } sort_stats_t;
 
 /* Size threshold for classifying large files during sorted extract.
@@ -1294,14 +1297,18 @@ static void stream_file_to_output(off_t fstart, off_t fend,
         const uint8_t *bdata;
         if (ce) {
             stats->cache_hits++;
+            stats->cache_hit_bytes += iter.block.uncompressed_size;
             bdata = ce->data;
         } else {
             if (!iter.stream.flags)
                 die("Missing stream flags for block");
-            if (lu_is_seen(lu, iter.block.compressed_file_offset))
+            if (lu_is_seen(lu, iter.block.compressed_file_offset)) {
                 stats->redecompressions++;
-            else
+                stats->redecompressed_bytes += iter.block.uncompressed_size;
+            } else {
                 stats->decompressions++;
+                stats->decompressed_bytes += iter.block.uncompressed_size;
+            }
             uint8_t *new_data = decompress_block_at(
                 iter.block.compressed_file_offset,
                 iter.stream.flags->check,
@@ -1528,10 +1535,17 @@ void pixz_sorted_extract(void) {
             if (do_print) sSortStatsPrint = 0;
             sigprocmask(SIG_SETMASK, &old, NULL);
             if (do_print)
-                fprintf(stderr, "sorted-extract stats [%zu/%zu]: decompressions=%zu"
-                        "  cache_hits=%zu  redecompressions=%zu\n",
+                fprintf(stderr, "sorted-extract stats [%zu/%zu]:"
+                        " decompressions=%zu (%.1f GiB)"
+                        "  cache_hits=%zu (%.1f GiB)"
+                        "  redecompressions=%zu (%.1f GiB)\n",
                         i + 1, count,
-                        stats.decompressions, stats.cache_hits, stats.redecompressions);
+                        stats.decompressions,
+                        (double)stats.decompressed_bytes / (1024.0*1024*1024),
+                        stats.cache_hits,
+                        (double)stats.cache_hit_bytes / (1024.0*1024*1024),
+                        stats.redecompressions,
+                        (double)stats.redecompressed_bytes / (1024.0*1024*1024));
         }
     }
 
@@ -1546,9 +1560,16 @@ void pixz_sorted_extract(void) {
     }
 
     if (gVerbose)
-        fprintf(stderr, "sorted-extract stats: decompressions=%zu  cache_hits=%zu"
-                "  redecompressions=%zu\n",
-                stats.decompressions, stats.cache_hits, stats.redecompressions);
+        fprintf(stderr, "sorted-extract stats:"
+                " decompressions=%zu (%.1f GiB)"
+                "  cache_hits=%zu (%.1f GiB)"
+                "  redecompressions=%zu (%.1f GiB)\n",
+                stats.decompressions,
+                (double)stats.decompressed_bytes / (1024.0*1024*1024),
+                stats.cache_hits,
+                (double)stats.cache_hit_bytes / (1024.0*1024*1024),
+                stats.redecompressions,
+                (double)stats.redecompressed_bytes / (1024.0*1024*1024));
 
     bc_free(&cache);
     lu_free(&lu);
