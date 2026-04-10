@@ -1499,7 +1499,7 @@ void pixz_sorted_extract(void) {
      * then evict any cache blocks whose last consumer was just this file. */
     bc_t   cache;
     bc_init(&cache);
-    sort_stats_t stats = { 0, 0, 0 };
+    sort_stats_t stats = { 0, 0, 0, 0, 0, 0 };
 
     /* tail_zeros: the number of trailing zero bytes to write after all sorted
      * entries.  We reproduce exactly the bytes that were at the tail of the
