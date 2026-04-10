@@ -31,6 +31,7 @@ static void usage(const char *msg) {
 "  pixz input.tar output.tpxz      # Compress and index a tarball\n"
 "  pixz -d input.tpxz output.tar   # Decompress\n"
 "  pixz -l input.tpxz              # List tarball contents very fast\n"
+"  pixz -l -v input.tpxz           # List with compressed and uncompressed offsets\n"
 "  pixz -x path/to/file < input.tpxz | tar x  # Extract one file very fast\n"
 "  pixz -S input.tpxz | tar x      # Extract sorted for best compression\n"
 "  pixz -S -D 64M input.tpxz | pixz -9 > out.tpxz  # Recompress; classify >=64M as large\n"
@@ -46,6 +47,8 @@ static void usage(const char *msg) {
 "  -p NUM             Use a maximum of NUM CPU-intensive threads\n"
 "  -t                 Don't assume input is in tar format\n"
 "  -k                 Keep original input (do not remove it)\n"
+"  -v                 With -l in tarball mode, print compressed and uncompressed\n"
+"                     offsets for each file\n"
 "  -c                 ignored\n"
 "  -S                 Extract sorted by file type then filename (optimises compression)\n"
 "  -S -l              Same, but list each file and print cache stats to stderr\n"
@@ -155,6 +158,7 @@ int main(int argc, char **argv) {
             case 'o': opath = optarg; break;
             case 't': tar = false; break;
             case 'k': keep_input = true; break;
+            case 'v': gVerbose = true; break;
 			case 'h': usage(NULL); break;
             case 'e': extreme = true; break;
             case 'V': version(); break;

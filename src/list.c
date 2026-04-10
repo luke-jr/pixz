@@ -10,7 +10,23 @@ void pixz_list(bool tar) {
     lzma_index_iter_init(&iter, gIndex);
 
     if (tar && read_file_index()) {
-        dump_file_index(stdout, false);
+        if (gVerbose) {
+            lzma_index_iter viter;
+            lzma_index_iter_init(&viter, gIndex);
+            for (file_index_t *f = gFileIndex; f != NULL; f = f->next) {
+                if (!f->name)
+                    continue;
+                if (lzma_index_iter_locate(&viter, (lzma_vli)f->offset))
+                    die("Can't locate block for uncompressed offset %"PRIuMAX,
+                        (uintmax_t)f->offset);
+                printf("%"PRIuMAX" %"PRIuMAX" %s\n",
+                    (uintmax_t)viter.block.compressed_file_offset,
+                    (uintmax_t)f->offset,
+                    f->name);
+            }
+        } else {
+            dump_file_index(stdout, false);
+        }
         free_file_index();
     } else {
         while (!lzma_index_iter_next(&iter, LZMA_INDEX_ITER_BLOCK)) {
